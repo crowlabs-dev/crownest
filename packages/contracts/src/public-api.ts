@@ -34,6 +34,8 @@ export type ApiErrorResponse = {
     readonly code: string;
     readonly message: string;
     readonly details?: Readonly<Record<string, unknown>>;
+    readonly requestId?: string;
+    readonly retryable?: boolean;
   };
 };
 
@@ -56,13 +58,19 @@ export type CreateSandboxResponse = {
   readonly sandbox: Sandbox;
 };
 
-export type ExtendSandboxBody = {
+export type SetSandboxTtlBody = {
   readonly ttlMs: number;
 };
 
-export type ExtendSandboxResponse = {
+export type SetSandboxTtlResponse = {
   readonly sandbox: Sandbox;
 };
+
+/** @deprecated Use SetSandboxTtlBody. */
+export type ExtendSandboxBody = SetSandboxTtlBody;
+
+/** @deprecated Use SetSandboxTtlResponse. */
+export type ExtendSandboxResponse = SetSandboxTtlResponse;
 
 export type ListSandboxesResponse = Pagination<Sandbox>;
 
@@ -75,6 +83,7 @@ export type KillSandboxResponse = {
 };
 
 export type RunCommandBody = {
+  readonly background?: boolean;
   readonly collect?: readonly CommandCollectRequest[];
   readonly collectOn?: CommandCollectOn;
   readonly command: string;

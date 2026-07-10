@@ -1,4 +1,4 @@
-/* eslint-disable max-lines-per-function -- Transport construction keeps shared request auth behavior together. */
+/* eslint-disable max-lines, max-lines-per-function -- Transport and protocol helpers stay together. */
 
 import type {
   ApiErrorResponse,
@@ -7,38 +7,83 @@ import type {
   CommandCollectOn,
   CommandCollectRequest,
   CommandLogStreamEvent,
+  ErrorCode,
   RunCommandResponse,
 } from "@crownest/contracts";
+
+import { fetchWithRetry, retryableStatus, retryAfterMs } from "./transport-retry";
 
 export type CrowNestClientOptions = {
   readonly apiKey?: string;
   readonly baseUrl?: string;
   readonly credential?: string;
   readonly fetch?: typeof fetch;
+  readonly maxRetries?: number;
+  /**
+   * Unary request wall-clock deadline. For SSE, this bounds connection setup
+   * and becomes the default inactivity window after response headers arrive.
+   */
+  readonly timeoutMs?: number;
 };
 
+export type RequestOptions = {
+  /** Cancels this request without affecting other client operations. */
+  readonly signal?: AbortSignal | undefined;
+  /**
+   * Overrides the client timeout. This is a wall-clock deadline for unary
+   * requests and a connection-establishment deadline for SSE requests.
+   */
+  readonly timeoutMs?: number;
+};
+
+export type StreamRequestOptions = RequestOptions & {
+  /**
+   * Abort when no SSE bytes arrive within this window. Each chunk, including a
+   * server heartbeat, resets the deadline. Defaults to `timeoutMs`.
+   */
+  readonly streamIdleTimeoutMs?: number | undefined;
+};
+
+export type CrowNestErrorCode = ErrorCode | (string & {});
+
 export class CrowNestApiError extends Error {
-  readonly code: string;
+  readonly #retryableOverride: boolean | undefined;
+  readonly code: CrowNestErrorCode;
   readonly details: Readonly<Record<string, unknown>> | undefined;
+  readonly requestId: string | undefined;
+  readonly retryAfterMs: number | undefined;
   readonly status: number;
 
-  constructor(status: number, error: ApiErrorResponse["error"]) {
+  constructor(status: number, error: ApiErrorPayload, headers?: Headers) {
     super(error.message);
     this.name = "CrowNestApiError";
     this.code = error.code;
     this.details = error.details;
+    this.requestId = headers?.get("x-request-id") ?? undefined;
+    this.retryAfterMs = retryAfterMs(headers) ?? error.retryAfterMs;
+    this.#retryableOverride = error.retryable;
     this.status = status;
+  }
+
+  get retryable(): boolean {
+    return (
+      this.#retryableOverride ??
+      (retryableStatus(this.status) ||
+        this.code === "rate_limited" ||
+        this.code === "slow_down" ||
+        this.code === "idempotency_request_in_progress")
+    );
   }
 }
 
 export type Transport = {
-  download(url: string): Promise<Uint8Array>;
+  download(url: string, options?: RequestOptions): Promise<Uint8Array>;
   raw(url: string, init: RawRequestInit): Promise<Response>;
   request<T>(path: string, init: ApiRequestInit): Promise<T>;
   streamSse<T>(path: string, init?: ApiStreamInit): AsyncIterable<T>;
 };
 
-export type RunCommandOptions = {
+type RunCommandCommonOptions = {
   readonly collect?: readonly CommandCollectRequest[];
   readonly collectOn?: CommandCollectOn;
   readonly cwd?: string;
@@ -50,11 +95,27 @@ export type RunCommandOptions = {
   readonly timeoutMs?: number;
 };
 
+export type RunCommandOptions = RunCommandCommonOptions &
+  (
+    | {
+        /** Return immediately while the Command continues running. */
+        readonly background: true;
+        readonly collect?: never;
+        readonly collectOn?: never;
+      }
+    | {
+        /** Wait for the Command to finish. This is the default. */
+        readonly background?: false;
+      }
+  );
+
 type ApiRequestInit = {
   readonly body?: unknown;
   readonly idempotencyKey?: string;
   readonly idempotent?: boolean;
   readonly method: "DELETE" | "GET" | "POST" | "PUT";
+  readonly signal?: AbortSignal | undefined;
+  readonly timeoutMs?: number;
 };
 
 type ApiStreamInit = {
@@ -62,6 +123,9 @@ type ApiStreamInit = {
   readonly idempotencyKey?: string;
   readonly idempotent?: boolean;
   readonly method?: "GET" | "POST";
+  readonly signal?: AbortSignal | undefined;
+  readonly streamIdleTimeoutMs?: number | undefined;
+  readonly timeoutMs?: number | undefined;
 };
 
 type RawRequestInit = {
@@ -72,11 +136,20 @@ type RawRequestInit = {
   readonly idempotencyKey?: string;
   readonly idempotent?: boolean;
   readonly method: "GET" | "POST" | "PUT";
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
+};
+
+type ApiErrorPayload = ApiErrorResponse["error"] & {
+  readonly retryAfterMs?: number;
+  readonly retryable?: boolean;
 };
 
 export function createTransport(options: CrowNestClientOptions): Transport {
   const baseUrl = (options.baseUrl ?? "https://api.crownest.dev").replace(/\/$/, "");
   const fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
+  const maxRetries = options.maxRetries ?? 2;
+  const defaultTimeoutMs = options.timeoutMs;
   const credential = options.credential ?? options.apiKey ?? readEnvCredential();
 
   if (credential === undefined || credential.length === 0) {
@@ -86,26 +159,35 @@ export function createTransport(options: CrowNestClientOptions): Transport {
   }
 
   return {
-    async download(url) {
+    async download(url, requestOptions = {}) {
       const headers = new Headers();
       headers.set("accept", "application/octet-stream");
 
       headers.set("authorization", `Bearer ${credential}`);
+      setSdkHeaders(headers);
 
-      const response = await fetchImpl(resolveUrl(baseUrl, url), {
-        headers,
-        method: "GET",
-      });
-
-      if (!response.ok) {
-        throw await parseErrorResponse(response);
-      }
-
-      return new Uint8Array(await response.arrayBuffer());
+      return withRequestSignal(
+        requestOptions.signal,
+        requestOptions.timeoutMs ?? defaultTimeoutMs,
+        async (signal) => {
+          const response = await fetchWithRetry(
+            () =>
+              fetchImpl(resolveUrl(baseUrl, url), {
+                headers,
+                method: "GET",
+                signal,
+              }),
+            { canRetry: true, maxRetries, signal },
+          );
+          if (!response.ok) throw await parseErrorResponse(response);
+          return new Uint8Array(await response.arrayBuffer());
+        },
+      );
     },
     async raw(url, init) {
       const headers = new Headers(init.headers);
       const resolvedUrl = resolveUrl(baseUrl, url);
+      setSdkHeaders(headers);
 
       if (shouldAuthenticateRawRequest(baseUrl, resolvedUrl, init.auth)) {
         headers.set("authorization", `Bearer ${credential}`);
@@ -123,7 +205,18 @@ export function createTransport(options: CrowNestClientOptions): Transport {
         headers,
         method: init.method,
       };
-      const response = await fetchImpl(resolvedUrl, requestInit);
+      const response = await withRequestSignal(
+        init.signal,
+        init.timeoutMs ?? defaultTimeoutMs,
+        (signal) =>
+          fetchWithRetry(() => fetchImpl(resolvedUrl, { ...requestInit, signal }), {
+            canRetry:
+              !isReadableStreamBody(init.body) &&
+              (init.method === "GET" || headers.has("idempotency-key")),
+            maxRetries,
+            signal,
+          }),
+      );
 
       if (!response.ok) {
         if (init.apiError === false) {
@@ -139,6 +232,7 @@ export function createTransport(options: CrowNestClientOptions): Transport {
       headers.set("accept", "application/json");
 
       headers.set("authorization", `Bearer ${credential}`);
+      setSdkHeaders(headers);
 
       if (init.body !== undefined) {
         headers.set("content-type", "application/json");
@@ -150,23 +244,35 @@ export function createTransport(options: CrowNestClientOptions): Transport {
         headers.set("idempotency-key", createIdempotencyKey());
       }
 
-      const response = await fetchImpl(`${baseUrl}${path}`, {
-        headers,
-        method: init.method,
-        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
-      });
-      if (!response.ok) {
-        throw await parseErrorResponse(response);
-      }
-
-      return (await response.json()) as T;
+      return withRequestSignal(
+        init.signal,
+        init.timeoutMs ?? defaultTimeoutMs,
+        async (signal) => {
+          const response = await fetchWithRetry(
+            () =>
+              fetchImpl(`${baseUrl}${path}`, {
+                headers,
+                method: init.method,
+                signal,
+                ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+              }),
+            {
+              canRetry: init.method === "GET" || headers.has("idempotency-key"),
+              maxRetries,
+              signal,
+            },
+          );
+          if (!response.ok) throw await parseErrorResponse(response);
+          return (await response.json()) as T;
+        },
+      );
     },
     async *streamSse<T>(path: string, init: ApiStreamInit = {}) {
-      const abortController = new AbortController();
       const headers = new Headers();
       headers.set("accept", "text/event-stream");
 
       headers.set("authorization", `Bearer ${credential}`);
+      setSdkHeaders(headers);
 
       if (init.body !== undefined) {
         headers.set("content-type", "application/json");
@@ -178,14 +284,20 @@ export function createTransport(options: CrowNestClientOptions): Transport {
         headers.set("idempotency-key", createIdempotencyKey());
       }
 
-      const response = await fetchImpl(`${baseUrl}${path}`, {
-        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
-        headers,
-        method: init.method ?? "GET",
-        signal: abortController.signal,
-      });
-
+      const requestSignal = createRequestSignal(
+        init.signal,
+        init.timeoutMs ?? defaultTimeoutMs,
+      );
+      const streamIdleTimeoutMs =
+        init.streamIdleTimeoutMs ?? init.timeoutMs ?? defaultTimeoutMs;
       try {
+        const response = await fetchImpl(`${baseUrl}${path}`, {
+          ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+          headers,
+          method: init.method ?? "GET",
+          signal: requestSignal.signal,
+        });
+        requestSignal.clearTimeout();
         if (!response.ok) {
           throw await parseErrorResponse(response);
         }
@@ -194,11 +306,82 @@ export function createTransport(options: CrowNestClientOptions): Transport {
           return;
         }
 
-        yield* parseSseStream<T>(response.body);
+        yield* parseSseStream<T>(
+          response.body,
+          requestSignal.signal,
+          streamIdleTimeoutMs,
+          requestSignal.abort,
+        );
       } finally {
-        abortController.abort();
+        requestSignal.abort();
       }
     },
+  };
+}
+
+const sdkHeaderValue = "@crownest/sdk/0.1.2";
+
+function setSdkHeaders(headers: Headers): void {
+  headers.set("x-crownest-sdk", sdkHeaderValue);
+}
+
+async function withRequestSignal<T>(
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const requestSignal = createRequestSignal(signal, timeoutMs);
+  try {
+    return await operation(requestSignal.signal);
+  } finally {
+    requestSignal.dispose();
+  }
+}
+
+function createRequestSignal(
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): {
+  readonly abort: (reason?: unknown) => void;
+  readonly clearTimeout: () => void;
+  readonly dispose: () => void;
+  readonly signal: AbortSignal;
+} {
+  const controller = new AbortController();
+  const abortFromCaller = () => {
+    controller.abort(signal?.reason);
+  };
+  if (signal?.aborted) abortFromCaller();
+  else signal?.addEventListener("abort", abortFromCaller, { once: true });
+
+  const timer =
+    timeoutMs === undefined
+      ? undefined
+      : setTimeout(
+          () => {
+            controller.abort(
+              new DOMException(
+                `Request timed out after ${timeoutMs}ms.`,
+                "TimeoutError",
+              ),
+            );
+          },
+          Math.max(0, timeoutMs),
+        );
+  const dispose = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    signal?.removeEventListener("abort", abortFromCaller);
+  };
+  return {
+    abort(reason) {
+      controller.abort(reason);
+      dispose();
+    },
+    clearTimeout() {
+      if (timer !== undefined) clearTimeout(timer);
+    },
+    dispose,
+    signal: controller.signal,
   };
 }
 
@@ -217,12 +400,16 @@ function readEnvCredential(): string | undefined {
 async function parseErrorResponse(response: Response): Promise<CrowNestApiError> {
   try {
     const payload = (await response.json()) as ApiErrorResponse;
-    return new CrowNestApiError(response.status, payload.error);
+    return new CrowNestApiError(response.status, payload.error, response.headers);
   } catch {
-    return new CrowNestApiError(response.status, {
-      code: "invalid_error_response",
-      message: `Request failed with status ${response.status} and a non-JSON response body.`,
-    });
+    return new CrowNestApiError(
+      response.status,
+      {
+        code: "invalid_error_response",
+        message: `Request failed with status ${response.status} and a non-JSON response body.`,
+      },
+      response.headers,
+    );
   }
 }
 
@@ -293,7 +480,6 @@ export async function runSandboxCommand(
   transport: Transport,
   sandboxId: `sbx_${string}`,
   command: string,
-  mode: "run" | "start",
   options: RunCommandOptions = {},
 ): Promise<Command> {
   const {
@@ -304,7 +490,7 @@ export async function runSandboxCommand(
     ...body
   } = options;
   const response = await transport.request<RunCommandResponse>(
-    `/v1/sandboxes/${sandboxId}/commands/${mode}`,
+    `/v1/sandboxes/${sandboxId}/commands`,
     {
       body: { command, ...body },
       ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
@@ -358,7 +544,12 @@ export function notifyCommandStreamError(
   }
 }
 
-async function* parseSseStream<T>(body: ReadableStream<Uint8Array>): AsyncIterable<T> {
+async function* parseSseStream<T>(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  idleTimeoutMs: number | undefined,
+  abort: (reason?: unknown) => void,
+): AsyncIterable<T> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -366,7 +557,7 @@ async function* parseSseStream<T>(body: ReadableStream<Uint8Array>): AsyncIterab
 
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readSseChunk(reader, signal, idleTimeoutMs, abort);
       if (done) {
         completed = true;
         break;
@@ -398,6 +589,73 @@ async function* parseSseStream<T>(body: ReadableStream<Uint8Array>): AsyncIterab
   }
 }
 
+function readSseChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal,
+  idleTimeoutMs: number | undefined,
+  abort: (reason?: unknown) => void,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer =
+      idleTimeoutMs === undefined
+        ? undefined
+        : setTimeout(
+            () => {
+              const error = new DOMException(
+                `SSE stream received no data for ${idleTimeoutMs}ms.`,
+                "TimeoutError",
+              );
+              abort(error);
+              finish(() => {
+                reject(error);
+              });
+            },
+            Math.max(0, idleTimeoutMs),
+          );
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    void reader.read().then(
+      (result) => {
+        finish(() => {
+          resolve(result);
+        });
+      },
+      (error: unknown) => {
+        finish(() => {
+          reject(asError(error));
+        });
+      },
+    );
+
+    function onAbort() {
+      finish(() => {
+        reject(abortReason(signal));
+      });
+    }
+
+    function finish(settle: () => void) {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      settle();
+    }
+  });
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted.", "AbortError");
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 function parseSsePayload(event: string): unknown {
   const data = event
     .split("\n")
@@ -420,4 +678,4 @@ function createIdempotencyKey(): string {
   return `idem_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 }
 
-/* eslint-enable max-lines-per-function -- End transport construction helpers. */
+/* eslint-enable max-lines, max-lines-per-function -- End transport and protocol helpers. */

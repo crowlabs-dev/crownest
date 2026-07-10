@@ -23,7 +23,7 @@ export type TestClient = CrowNestClient & {
     readonly deleteArtifact: Mock;
     readonly downloadArtifact: Mock;
     readonly downloadArtifactUrl: Mock;
-    readonly extendSandbox: Mock;
+    readonly setSandboxTtl: Mock;
     readonly finalizeWorkspaceRunArchive: Mock;
     readonly getApiKey: Mock;
     readonly getArtifact: Mock;
@@ -40,7 +40,6 @@ export type TestClient = CrowNestClient & {
     readonly readCommandLogs: Mock;
     readonly revokeApiKey: Mock;
     readonly revokePreview: Mock;
-    readonly startCommand: Mock;
     readonly startWorkspaceRun: Mock;
     readonly cancelWorkspaceRun: Mock;
     readonly uploadWorkspaceRunArchive: Mock;
@@ -61,7 +60,6 @@ export type TestSandbox = SandboxHandle & {
     readonly codeRun: Mock;
     readonly commandCancel: Mock;
     readonly commandRun: Mock;
-    readonly commandStart: Mock;
     readonly fileDelete: Mock;
     readonly fileDownloadUrl: Mock;
     readonly fileList: Mock;
@@ -75,7 +73,7 @@ export type TestSandbox = SandboxHandle & {
     readonly kill: Mock;
     readonly previewCreate: Mock;
     readonly previewList: Mock;
-    readonly sandboxExtend: Mock;
+    readonly sandboxSetTtl: Mock;
   };
 };
 
@@ -132,7 +130,6 @@ export function createSandboxHandle(
     commands: {
       cancel: mocks.commandCancel,
       run: mocks.commandRun,
-      start: mocks.commandStart,
     },
     createdAt: "2026-06-12T12:00:00.000Z",
     expiresAt: input.expiresAt ?? "2999-01-01T00:00:00.000Z",
@@ -160,7 +157,7 @@ export function createSandboxHandle(
     templateSlug: "python-node",
     templateVersion: "1.0.0",
     ttlMs: 60_000,
-    extend: mocks.sandboxExtend,
+    setTtl: mocks.sandboxSetTtl,
   } as unknown as TestSandbox;
 }
 
@@ -204,7 +201,6 @@ function createClient(sandboxes: readonly SandboxHandle[]): TestClient {
       cancel: mocks.cancelCommand,
       get: mocks.getCommand,
       logs: mocks.readCommandLogs,
-      start: mocks.startCommand,
     },
     files: {},
     mocks,
@@ -212,9 +208,9 @@ function createClient(sandboxes: readonly SandboxHandle[]): TestClient {
     projects: { create: mocks.createProject, list: mocks.listProjects },
     sandboxes: {
       create: mocks.createSandbox,
-      extend: mocks.extendSandbox,
       get: mocks.getSandbox,
       list: mocks.listSandboxes,
+      setTtl: mocks.setSandboxTtl,
     },
     usage: mocks.usage,
     workspaceRuns: {
@@ -244,7 +240,6 @@ function clientMocks(): ClientMocks {
     deleteArtifact: vi.fn(),
     downloadArtifact: vi.fn(),
     downloadArtifactUrl: vi.fn(),
-    extendSandbox: vi.fn(),
     finalizeWorkspaceRunArchive: vi.fn(),
     getApiKey: vi.fn(),
     getArtifact: vi.fn(),
@@ -261,7 +256,7 @@ function clientMocks(): ClientMocks {
     readCommandLogs: vi.fn(),
     revokeApiKey: vi.fn(),
     revokePreview: vi.fn(),
-    startCommand: vi.fn(),
+    setSandboxTtl: vi.fn(),
     startWorkspaceRun: vi.fn(),
     uploadWorkspaceRunArchive: vi.fn(),
     uploadWorkspaceRunArchiveToTransfer: vi.fn(),
@@ -280,7 +275,6 @@ function sandboxMocks(): TestSandbox["mocks"] {
     codeRun: vi.fn(),
     commandCancel: vi.fn(),
     commandRun: vi.fn(),
-    commandStart: vi.fn(),
     fileDelete: vi.fn().mockResolvedValue(undefined),
     fileDownloadUrl: vi.fn(),
     fileList: vi.fn(),
@@ -294,6 +288,6 @@ function sandboxMocks(): TestSandbox["mocks"] {
     kill: vi.fn().mockResolvedValue(undefined),
     previewCreate: vi.fn(),
     previewList: vi.fn(),
-    sandboxExtend: vi.fn(),
+    sandboxSetTtl: vi.fn(),
   };
 }

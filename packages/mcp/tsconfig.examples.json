@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": "../..",
+    "paths": {
+      "@crownest/sdk": ["packages/sdk/src/index.ts"]
+    }
+  },
+  "include": ["../../examples/typescript-sdk.ts"]
+}

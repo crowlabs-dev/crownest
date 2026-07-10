@@ -5,17 +5,19 @@ import type {
   CreateSandboxResponse,
   DeleteArtifactResponse,
   DeletePreviewResponse,
-  ExtendSandboxResponse,
+  ErrorCode,
   GetApiKeyResponse,
   GetArtifactResponse,
   GetCommandResponse,
   GetPreviewResponse,
   GetSandboxResponse,
+  KillSandboxResponse,
   ListApiKeysResponse,
   ListCommandLogsResponse,
   ListProjectsResponse,
   ListSandboxesResponse,
   RevokeApiKeyResponse,
+  SetSandboxTtlResponse,
   UsageSummaryResponse,
 } from "@crownest/contracts";
 import { ApiKeyScopes } from "@crownest/contracts";
@@ -23,9 +25,12 @@ import { ApiKeyScopes } from "@crownest/contracts";
 import type {
   CreateSandboxInput,
   CrowNestClient,
+  ListInput,
   ListSandboxesInput,
 } from "./client-types";
 import { runCommandWithCallbacks, streamCommandLogs } from "./command-stream";
+import { createPage, paginationParams } from "./pagination";
+import { pollUntil } from "./polling";
 import {
   cancelCommand,
   commandLogParams,
@@ -34,10 +39,10 @@ import {
   queryString,
   type Transport,
 } from "./protocol";
+import { createSandboxFilesClient } from "./sandbox-files-client";
 import {
   createSandboxArtifactsClient,
   createSandboxCodeClient,
-  createSandboxFilesClient,
   createSandboxHandle,
   createSandboxPreviewsClient,
 } from "./sandbox-handle";
@@ -46,26 +51,42 @@ import { createWorkspaceRunsClient } from "./workspace-runs";
 export type {
   CodeArtifactPolicy,
   CodeLanguage,
+  CommandStreamInput,
   CreateProjectInput,
   CreateSandboxInput,
   CreateWorkspaceRunArchiveTransferInput,
   CreateWorkspaceRunInput,
   CrowNestClient,
-  ExtendSandboxInput,
   FinalizeWorkspaceRunArchiveInput,
+  ListInput,
   ListSandboxesInput,
+  ListSandboxHandlesResponse,
   ListWorkspaceRunsInput,
+  RunWorkspaceRunArchiveInput,
+  RunWorkspaceRunInput,
+  SetSandboxTtlInput,
   StartWorkspaceRunInput,
   UploadWorkspaceRunArchiveInput,
   UploadWorkspaceRunArchiveTransferInput,
+  WaitForCommandInput,
+  WaitForTerminalInput,
+  WaitUntilDoneInput,
+  WaitUntilReadyInput,
   WorkspaceRunEventsInput,
   WorkspaceRunsClient,
 } from "./client-types";
-export type { CrowNestClientOptions, RunCommandOptions } from "./protocol";
+export type { AutoPage } from "./pagination";
+export type {
+  CrowNestClientOptions,
+  CrowNestErrorCode,
+  RequestOptions,
+  RunCommandOptions,
+  StreamRequestOptions,
+} from "./protocol";
 export { CrowNestApiError } from "./protocol";
 export type { SandboxHandle } from "./sandbox-handle";
 export { ApiKeyScopes };
-export type { ApiKeyScope };
+export type { ApiKeyScope, ErrorCode };
 
 /**
  * Create a CrowNest TypeScript client for Sandbox, Command, Code Run,
@@ -107,8 +128,8 @@ function createCodeClient(transport: Transport): CrowNestClient["code"] {
     getContext(sandboxId, contextId) {
       return createSandboxCodeClient(sandboxId, transport).getContext(contextId);
     },
-    listContexts(sandboxId) {
-      return createSandboxCodeClient(sandboxId, transport).listContexts();
+    listContexts(sandboxId, input) {
+      return createSandboxCodeClient(sandboxId, transport).listContexts(input);
     },
     run(sandboxId, input) {
       return createSandboxCodeClient(sandboxId, transport).run(input);
@@ -128,11 +149,13 @@ function createApiKeyClient(transport: Transport): CrowNestClient["apiKeys"] {
       );
       return response.apiKey;
     },
-    async list() {
-      const response = await transport.request<ListApiKeysResponse>("/v1/api-keys", {
-        method: "GET",
-      });
-      return response.data;
+    async list(input: ListInput = {}) {
+      const fetchPage = (cursor = input.cursor) =>
+        transport.request<ListApiKeysResponse>(
+          `/v1/api-keys${queryString(paginationParams({ ...input, cursor }))}`,
+          { method: "GET", signal: input.signal },
+        );
+      return createPage(await fetchPage(), fetchPage);
     },
     async revoke(apiKeyId) {
       const response = await transport.request<RevokeApiKeyResponse>(
@@ -172,8 +195,8 @@ function createArtifactClient(transport: Transport): CrowNestClient["artifacts"]
       );
       return response.artifact;
     },
-    list(sandboxId) {
-      return createSandboxArtifactsClient(sandboxId, transport).list();
+    list(sandboxId, input) {
+      return createSandboxArtifactsClient(sandboxId, transport).list(input);
     },
   };
 }
@@ -229,8 +252,8 @@ function createPreviewClient(transport: Transport): CrowNestClient["previews"] {
       );
       return response.preview;
     },
-    list(sandboxId) {
-      return createSandboxPreviewsClient(sandboxId, transport).list();
+    list(sandboxId, input) {
+      return createSandboxPreviewsClient(sandboxId, transport).list(input);
     },
     async revoke(previewId) {
       const response = await transport.request<DeletePreviewResponse>(
@@ -251,11 +274,13 @@ function createProjectClient(transport: Transport): CrowNestClient["projects"] {
       });
       return response.project;
     },
-    async list() {
-      const response = await transport.request<ListProjectsResponse>("/v1/projects", {
-        method: "GET",
-      });
-      return response.data;
+    async list(input: ListInput = {}) {
+      const fetchPage = (cursor = input.cursor) =>
+        transport.request<ListProjectsResponse>(
+          `/v1/projects${queryString(paginationParams({ ...input, cursor }))}`,
+          { method: "GET", signal: input.signal },
+        );
+      return createPage(await fetchPage(), fetchPage);
     },
   };
 }
@@ -277,16 +302,30 @@ function createCommandClient(transport: Transport): CrowNestClient["commands"] {
         { method: "GET" },
       );
 
-      return response.data;
+      return response;
     },
     run(sandboxId, command, input = {}) {
-      return runCommandWithCallbacks(transport, sandboxId, command, "run", input);
-    },
-    start(sandboxId, command, input = {}) {
-      return runCommandWithCallbacks(transport, sandboxId, command, "start", input);
+      return runCommandWithCallbacks(transport, sandboxId, command, input);
     },
     streamLogs(commandId, input = {}) {
       return streamCommandLogs(transport, commandId, input);
+    },
+    wait(commandId, input = {}) {
+      return pollUntil({
+        fetch: async () => {
+          const response = await transport.request<GetCommandResponse>(
+            `/v1/commands/${commandId}`,
+            { method: "GET", signal: input.signal },
+          );
+          return response.command;
+        },
+        isTerminal: (command) =>
+          ["exited", "failed", "canceled", "timed_out", "killed"].includes(
+            command.status,
+          ),
+        options: input,
+        timeoutMessage: `Timed out waiting for Command ${commandId} to finish.`,
+      });
     },
   };
 }
@@ -304,10 +343,10 @@ function createSandboxClient(transport: Transport): CrowNestClient["sandboxes"] 
 
       return createSandboxHandle(response.sandbox, transport);
     },
-    async extend(sandboxId, input) {
+    async setTtl(sandboxId, input) {
       const { idempotencyKey, ...body } = input;
-      const response = await transport.request<ExtendSandboxResponse>(
-        `/v1/sandboxes/${sandboxId}/extend`,
+      const response = await transport.request<SetSandboxTtlResponse>(
+        `/v1/sandboxes/${sandboxId}/ttl`,
         {
           body,
           ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
@@ -327,27 +366,30 @@ function createSandboxClient(transport: Transport): CrowNestClient["sandboxes"] 
       return createSandboxHandle(response.sandbox, transport);
     },
     async kill(sandboxId) {
-      const response = await transport.request<GetSandboxResponse>(
+      const response = await transport.request<KillSandboxResponse>(
         `/v1/sandboxes/${sandboxId}`,
         { method: "DELETE" },
       );
-      return response.sandbox;
+      return createSandboxHandle(response.sandbox, transport);
     },
     async list(input = {}) {
-      const response = await transport.request<ListSandboxesResponse>(
-        `/v1/sandboxes${queryString(sandboxListParams(input))}`,
-        {
-          method: "GET",
-        },
-      );
-
-      return response.data;
+      const fetchPage = async (cursor = input.cursor) => {
+        const response = await transport.request<ListSandboxesResponse>(
+          `/v1/sandboxes${queryString(sandboxListParams({ ...input, cursor }))}`,
+          { method: "GET", signal: input.signal },
+        );
+        return {
+          ...response,
+          data: response.data.map((sandbox) => createSandboxHandle(sandbox, transport)),
+        };
+      };
+      return createPage(await fetchPage(), fetchPage);
     },
   };
 }
 
 function sandboxListParams(input: ListSandboxesInput): URLSearchParams {
-  const params = new URLSearchParams();
+  const params = paginationParams(input);
   for (const [key, value] of Object.entries(input.metadata ?? {})) {
     params.set(`metadata.${key}`, value);
   }

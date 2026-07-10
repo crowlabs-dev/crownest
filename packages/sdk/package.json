@@ -49,6 +49,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node ../../scripts/rewrite-dts-extensions.mjs dist && esbuild src/index.ts --bundle --platform=neutral --format=esm --target=es2022 --outfile=dist/index.js",
+    "lint": "eslint --max-warnings=0 .",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -56,6 +57,6 @@
     "@crownest/contracts": "workspace:*"
   },
   "devDependencies": {
-    "esbuild": "^0.28.0"
+    "esbuild": "catalog:"
   }
 }

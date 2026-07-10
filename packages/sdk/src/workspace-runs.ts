@@ -16,15 +16,19 @@ import type {
 
 import type {
   ListWorkspaceRunsInput,
+  WaitForTerminalInput,
   WorkspaceRunEventsInput,
   WorkspaceRunsClient,
 } from "./client-types";
+import { createPage, paginationParams } from "./pagination";
+import { pollUntil } from "./polling";
 import { CrowNestApiError, queryString, type Transport } from "./protocol";
 
 const streamReconnectDelaysMs = [250, 500, 1_000, 2_000, 4_000] as const;
+const maxDirectWorkspaceRunArchiveBytes = 8 * 1024 * 1024;
 
 export function createWorkspaceRunsClient(transport: Transport): WorkspaceRunsClient {
-  return {
+  const client: WorkspaceRunsClient = {
     async cancel(workspaceRunId) {
       const response = await transport.request<CancelWorkspaceRunResponse>(
         `/v1/workspace-runs/${workspaceRunId}/cancel`,
@@ -86,11 +90,14 @@ export function createWorkspaceRunsClient(transport: Transport): WorkspaceRunsCl
       return response.workspaceRun;
     },
     async list(input = {}) {
-      const response = await transport.request<ListWorkspaceRunsResponse>(
-        `/v1/workspace-runs${queryString(workspaceRunListParams(input))}`,
-        { method: "GET" },
-      );
-      return response.data;
+      const fetchPage = (cursor = input.cursor) =>
+        transport.request<ListWorkspaceRunsResponse>(
+          `/v1/workspace-runs${queryString(
+            workspaceRunListParams({ ...input, cursor }),
+          )}`,
+          { method: "GET", signal: input.signal },
+        );
+      return createPage(await fetchPage(), fetchPage);
     },
     listEvents(workspaceRunId, input = {}) {
       return transport.request<ListWorkspaceRunEventsResponse>(
@@ -99,6 +106,48 @@ export function createWorkspaceRunsClient(transport: Transport): WorkspaceRunsCl
         )}`,
         { method: "GET" },
       );
+    },
+    async runArchive(input) {
+      const { archive, ...createInput } = input;
+      const run = await client.create(createInput);
+      const transfer = await client.createArchiveTransfer(run.id, {
+        sha256: archive.sha256,
+        sizeBytes: archive.sizeBytes,
+      });
+      await client.uploadArchiveToTransfer(transfer, {
+        body: archive.body,
+        ...(archive.headers === undefined ? {} : { headers: archive.headers }),
+      });
+      await client.finalizeArchive(run.id, {
+        sha256: archive.sha256,
+        sizeBytes: archive.sizeBytes,
+        uploadId: transfer.id,
+      });
+      return client.start(run.id);
+    },
+    async run(input) {
+      const { archive, wait, waitOptions, ...createInput } = input;
+      const run = await client.create(createInput);
+      if (archive.sizeBytes <= maxDirectWorkspaceRunArchiveBytes) {
+        await client.uploadArchive(run.id, {
+          bytes: await bodyBytes(archive.body),
+          sha256: archive.sha256,
+          sizeBytes: archive.sizeBytes,
+        });
+      } else {
+        const transfer = await client.createArchiveTransfer(run.id, {
+          sha256: archive.sha256,
+          sizeBytes: archive.sizeBytes,
+        });
+        await client.uploadArchiveToTransfer(transfer, { body: archive.body });
+        await client.finalizeArchive(run.id, {
+          sha256: archive.sha256,
+          sizeBytes: archive.sizeBytes,
+          uploadId: transfer.id,
+        });
+      }
+      const started = await client.start(run.id);
+      return wait ? client.waitUntilDone(started.id, waitOptions) : started;
     },
     async start(workspaceRunId, input = {}) {
       const { idempotencyKey } = input;
@@ -114,6 +163,9 @@ export function createWorkspaceRunsClient(transport: Transport): WorkspaceRunsCl
     },
     streamEvents(workspaceRunId, input = {}) {
       return streamWorkspaceRunEvents(transport, workspaceRunId, input);
+    },
+    waitUntilDone(workspaceRunId, input = {}) {
+      return waitUntilWorkspaceRunDone(transport, workspaceRunId, input);
     },
     async uploadArchive(workspaceRunId, input) {
       const { bytes, idempotencyKey, sha256, sizeBytes } = input;
@@ -143,6 +195,30 @@ export function createWorkspaceRunsClient(transport: Transport): WorkspaceRunsCl
       });
     },
   };
+  return client;
+}
+
+async function waitUntilWorkspaceRunDone(
+  transport: Transport,
+  workspaceRunId: `wsr_${string}`,
+  input: WaitForTerminalInput,
+) {
+  return pollUntil({
+    fetch: async () => {
+      const response = await transport.request<GetWorkspaceRunResponse>(
+        `/v1/workspace-runs/${workspaceRunId}`,
+        { method: "GET", signal: input.signal },
+      );
+      return response.workspaceRun;
+    },
+    isTerminal: (workspaceRun) => isTerminalWorkspaceRunStatus(workspaceRun.status),
+    options: { timeoutMs: 10 * 60_000, ...input },
+    timeoutMessage: `Timed out waiting for Workspace Run ${workspaceRunId} to finish.`,
+  });
+}
+
+function isTerminalWorkspaceRunStatus(status: string): boolean {
+  return status === "succeeded" || status === "failed" || status === "canceled";
 }
 
 function archiveHeaders(input: {
@@ -201,7 +277,7 @@ async function* streamWorkspaceRunEvents(
         "Workspace Run event stream ended before a terminal event.",
       );
     } catch (error) {
-      originalError = rememberStreamError(error, originalError);
+      originalError = rememberStreamError(error, originalError, input.signal);
     }
 
     if (madeProgress) {
@@ -222,8 +298,20 @@ function workspaceRunEventMadeProgress(
   return afterSeq === undefined || seq > afterSeq;
 }
 
-function rememberStreamError(error: unknown, originalError: unknown): unknown {
-  if (error instanceof CrowNestApiError) {
+function rememberStreamError(
+  error: unknown,
+  originalError: unknown,
+  signal: AbortSignal | undefined,
+): unknown {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException("The operation was aborted.", "AbortError");
+  }
+  if (
+    error instanceof CrowNestApiError ||
+    (error instanceof Error && error.name === "TimeoutError")
+  ) {
     throw error;
   }
   return originalError ?? error;
@@ -238,6 +326,11 @@ function streamWorkspaceRunEventsOnce(
   params.set("stream", "true");
   return transport.streamSse<WorkspaceRunStreamEvent>(
     `/v1/workspace-runs/${workspaceRunId}/events${queryString(params)}`,
+    {
+      signal: input.signal,
+      streamIdleTimeoutMs: input.streamIdleTimeoutMs,
+      timeoutMs: input.timeoutMs,
+    },
   );
 }
 
@@ -256,7 +349,7 @@ function bodyFromBytes(bytes: Uint8Array): BodyInit {
 }
 
 function workspaceRunListParams(input: ListWorkspaceRunsInput): URLSearchParams {
-  const params = new URLSearchParams();
+  const params = paginationParams(input);
   if (input.projectId !== undefined) {
     params.set("projectId", input.projectId);
   }
@@ -267,6 +360,11 @@ function workspaceRunListParams(input: ListWorkspaceRunsInput): URLSearchParams 
     params.set(`metadata.${key}`, value);
   }
   return params;
+}
+
+async function bodyBytes(body: BodyInit): Promise<Uint8Array> {
+  if (body instanceof Uint8Array) return body;
+  return new Uint8Array(await new Response(body).arrayBuffer());
 }
 
 /* eslint-enable max-lines-per-function -- End Workspace Run resource client. */

@@ -5,9 +5,11 @@ import { McpSessionError } from "./session";
 
 export function toolError(error: unknown): CallToolResult {
   if (error instanceof CrowNestApiError) {
+    const requestId = optionalString(error, "requestId");
     return errorResult(error.code, error.message, {
       details: error.details ?? null,
-      retryable: retryableApiError(error),
+      ...(requestId === undefined ? {} : { requestId }),
+      retryable: optionalBoolean(error, "retryable") ?? retryableApiError(error),
       status: error.status,
     });
   }
@@ -29,6 +31,7 @@ export function errorResult(
   options: {
     readonly details?: Readonly<Record<string, unknown>> | null;
     readonly remediation?: string | null;
+    readonly requestId?: string | null;
     readonly retryable?: boolean;
     readonly status?: number | null;
   } = {},
@@ -42,6 +45,7 @@ export function errorResult(
             details: options.details ?? null,
             message,
             remediation: options.remediation ?? null,
+            requestId: options.requestId ?? null,
             retryable: options.retryable ?? false,
             status: options.status ?? null,
           },
@@ -55,4 +59,14 @@ export function errorResult(
 
 function retryableApiError(error: CrowNestApiError): boolean {
   return error.status === 429 || error.status >= 500 || error.code === "rate_limited";
+}
+
+function optionalBoolean(value: object, key: string): boolean | undefined {
+  const field: unknown = (value as Readonly<Record<string, unknown>>)[key];
+  return typeof field === "boolean" ? field : undefined;
+}
+
+function optionalString(value: object, key: string): string | undefined {
+  const field: unknown = (value as Readonly<Record<string, unknown>>)[key];
+  return typeof field === "string" ? field : undefined;
 }

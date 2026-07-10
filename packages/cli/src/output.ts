@@ -7,6 +7,18 @@ export function jsonEnvelope(value: unknown): string {
   return `${JSON.stringify({ data: sanitizeForOutput(value) })}\n`;
 }
 
+export function jsonPageEnvelope(page: {
+  readonly data: readonly unknown[];
+  readonly hasMore: boolean;
+  readonly nextCursor?: string;
+}): string {
+  return `${JSON.stringify({
+    data: sanitizeForOutput(page.data),
+    hasMore: page.hasMore,
+    ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
+  })}\n`;
+}
+
 export function jsonErrorEnvelope(error: {
   readonly code: string;
   readonly details?: Readonly<Record<string, unknown>> | null;

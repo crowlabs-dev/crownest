@@ -17,7 +17,6 @@ const toolNames = [
   "run_code",
   "get_agent_context",
   "run_command",
-  "start_command",
   "create_sandbox",
   "kill_sandbox",
   "write_file",
@@ -31,7 +30,7 @@ const toolNames = [
   "list_sandboxes",
   "get_usage",
   "get_sandbox",
-  "extend_sandbox",
+  "set_sandbox_ttl",
   "get_command",
   "cancel_command",
   "stream_command_logs",
@@ -74,8 +73,8 @@ describe("registerCrowNestTools", () => {
     const { calls, tools } = createHarness();
 
     expect(calls.map((call) => call.name)).toEqual(toolNames);
-    expect(calls).toHaveLength(53);
-    expect(new Set(calls.map((call) => call.name)).size).toBe(53);
+    expect(calls).toHaveLength(52);
+    expect(new Set(calls.map((call) => call.name)).size).toBe(52);
     expect([...tools.keys()]).toEqual(toolNames);
     expectPromptNativeDescriptions(tools);
   });
@@ -85,6 +84,16 @@ describe("registerCrowNestTools", () => {
 
     expect(parseToolInput(tools, "create_sandbox", {})).toEqual({});
     expect(parseToolInput(tools, "get_agent_context", {})).toEqual({});
+    expect(parseToolInput(tools, "run_command", { command: "pwd" })).toEqual({
+      background: false,
+      command: "pwd",
+    });
+    expect(
+      parseToolInput(tools, "run_command", {
+        background: true,
+        command: "pnpm test",
+      }),
+    ).toEqual({ background: true, command: "pnpm test" });
     expect(parseToolInput(tools, "list_files", {})).toEqual({});
     expect(parseToolInput(tools, "list_sandboxes", {})).toEqual({});
     expect(parseToolInput(tools, "get_sandbox", {})).toEqual({});
@@ -95,6 +104,9 @@ describe("registerCrowNestTools", () => {
     expect(parseToolInput(tools, "list_api_keys", {})).toEqual({});
     expect(parseToolInput(tools, "list_projects", {})).toEqual({});
     expect(parseToolInput(tools, "list_workspace_runs", {})).toEqual({});
+    expect(parseToolInput(tools, "list_workspace_runs", { limit: 25 })).toEqual({
+      limit: 25,
+    });
   });
 
   it("rejects MCP inputs outside the reachable API surface", () => {
@@ -116,6 +128,31 @@ describe("registerCrowNestTools", () => {
         status: "failed",
       }),
     ).toBe(true);
+  });
+});
+
+describe("tool input validation", () => {
+  it("accepts one-page pagination inputs and enforces the server limit", () => {
+    const { tools } = createHarness();
+    const paginatedTools = [
+      "list_sandboxes",
+      "list_artifacts",
+      "list_previews",
+      "list_code_contexts",
+      "list_api_keys",
+      "list_projects",
+      "list_workspace_runs",
+    ] as const;
+
+    for (const name of paginatedTools) {
+      expect(parseToolInput(tools, name, { cursor: "next_page", limit: 500 })).toEqual({
+        cursor: "next_page",
+        limit: 500,
+      });
+      expect(rejectsToolInput(tools, name, { limit: 501 })).toBe(true);
+      expect(rejectsToolInput(tools, name, { limit: 0 })).toBe(true);
+      expect(rejectsToolInput(tools, name, { cursor: "" })).toBe(true);
+    }
   });
 
   it("rejects path-like resource IDs before SDK URL construction", () => {
@@ -153,14 +190,20 @@ function expectPromptNativeDescriptions(
     "rejected outputs",
   ]);
   expectDescription(tools, "get_agent_context", ["bounded CrowNest agent context"]);
-  expectDescription(tools, "run_command", ["default Sandbox", "/workspace"]);
-  expectDescription(tools, "start_command", ["without waiting", "get_command"]);
+  expectDescription(tools, "run_command", [
+    "Foreground mode is the default",
+    "waits for completion",
+    "background to true",
+    "get_command",
+    "stream_command_logs",
+  ]);
   expectDescription(tools, "create_sandbox", [
     "without changing the lazy default Sandbox",
     "MCP session exit cleanup",
   ]);
-  expectDescription(tools, "extend_sandbox", [
-    "resetting its Sandbox TTL from now",
+  expectDescription(tools, "set_sandbox_ttl", [
+    "resets the TTL countdown from now to ttl_ms",
+    "does not add ttl_ms",
     "cannot be revived",
   ]);
   expectDescription(tools, "get_usage", [

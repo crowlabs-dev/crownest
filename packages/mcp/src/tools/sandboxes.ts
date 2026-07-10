@@ -3,7 +3,14 @@ import { z } from "zod/v4";
 
 import { formatSandbox, formatSandboxList, jsonTextResult } from "../formatting";
 import type { McpSession } from "../session";
-import { handleTool, sandboxIdSchema, sandboxStatusSchema } from "./shared";
+import {
+  handleTool,
+  paginationCursorSchema,
+  paginationInput,
+  paginationLimitSchema,
+  sandboxIdSchema,
+  sandboxStatusSchema,
+} from "./shared";
 
 export function registerCreateSandbox(server: McpServer, session: McpSession): void {
   server.registerTool(
@@ -53,20 +60,19 @@ export function registerListSandboxes(server: McpServer, session: McpSession): v
       description:
         "List live CrowNest Sandboxes visible to the configured API Key. This is account-visible discovery, not just the MCP session cache; use get_usage to see the Sandboxes this MCP server is tracking.",
       inputSchema: z.object({
-        limit: z.number().int().positive().optional(),
+        cursor: paginationCursorSchema.optional(),
+        limit: paginationLimitSchema.optional(),
         status: sandboxStatusSchema.optional(),
       }),
     },
     (input) =>
       handleTool(async () => {
-        const sandboxes = await session.client.sandboxes.list();
+        const page = await session.client.sandboxes.list(paginationInput(input));
         const filtered =
           input.status === undefined
-            ? sandboxes
-            : sandboxes.filter((sandbox) => sandbox.status === input.status);
-        return formatSandboxList(
-          input.limit === undefined ? filtered : filtered.slice(0, input.limit),
-        );
+            ? page.data
+            : page.data.filter((sandbox) => sandbox.status === input.status);
+        return formatSandboxList(filtered, page);
       }),
   );
 }
@@ -92,12 +98,12 @@ export function registerGetSandbox(server: McpServer, session: McpSession): void
   );
 }
 
-export function registerExtendSandbox(server: McpServer, session: McpSession): void {
+export function registerSetSandboxTtl(server: McpServer, session: McpSession): void {
   server.registerTool(
-    "extend_sandbox",
+    "set_sandbox_ttl",
     {
       description:
-        "Extend a live CrowNest Sandbox by resetting its Sandbox TTL from now. Pass sandbox_id or omit sandbox_id to extend the current lazy default Sandbox; expired Sandboxes cannot be revived.",
+        "Set a live CrowNest Sandbox TTL. This resets the TTL countdown from now to ttl_ms; it does not add ttl_ms to the existing expiry. Pass sandbox_id or omit sandbox_id to update the current lazy default Sandbox; expired Sandboxes cannot be revived.",
       inputSchema: z.object({
         sandbox_id: sandboxIdSchema.optional(),
         ttl_ms: z.number().int().positive(),
@@ -108,12 +114,12 @@ export function registerExtendSandbox(server: McpServer, session: McpSession): v
         if (input.sandbox_id === undefined) {
           const sandbox = await (
             await session.resolveDefaultSandbox()
-          ).extend({ ttlMs: input.ttl_ms });
+          ).setTtl({ ttlMs: input.ttl_ms });
           session.rememberSandbox(sandbox);
           return formatSandbox(sandbox);
         }
 
-        const sandbox = await session.client.sandboxes.extend(
+        const sandbox = await session.client.sandboxes.setTtl(
           input.sandbox_id as `sbx_${string}`,
           { ttlMs: input.ttl_ms },
         );

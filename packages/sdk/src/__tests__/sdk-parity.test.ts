@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- SDK parity cases stay grouped around shared fixtures. */
 import { describe, expect, it, vi } from "vitest";
 
 import { createCrowNestClient } from "../index";
@@ -96,7 +97,7 @@ function registerSandboxListTests() {
 
     await expect(
       client.sandboxes.list({ metadata: { "agent.id": "codex/1", stage: "eval" } }),
-    ).resolves.toHaveLength(1);
+    ).resolves.toMatchObject({ data: [expect.objectContaining({ id: "sbx_123" })] });
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       "https://api.test/v1/sandboxes?metadata.agent.id=codex%2F1&metadata.stage=eval",
     );
@@ -109,7 +110,7 @@ function registerCommandCallbackTests() {
     const stderr = vi.fn();
     const fetchMock = vi.fn<typeof fetch>().mockImplementation((input) => {
       const path = requestUrl(input);
-      if (path.endsWith("/v1/sandboxes/sbx_123/commands/start")) {
+      if (path.endsWith("/v1/sandboxes/sbx_123/commands")) {
         return Promise.resolve(commandResponse("running"));
       }
       if (path.endsWith("/v1/commands/cmd_123/stream")) {
@@ -135,19 +136,20 @@ function registerCommandCallbackTests() {
     expect(stdout).toHaveBeenCalledWith("out\n");
     expect(stderr).toHaveBeenCalledWith("err\n");
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      "https://api.test/v1/sandboxes/sbx_123/commands/start",
+      "https://api.test/v1/sandboxes/sbx_123/commands",
     );
     expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toEqual({
       _crownestRequireCommandRead: true,
+      background: true,
       command: "npm test",
       timeoutMs: 60_000,
     });
   });
 
-  it("does not surface unhandled errors when stream error callbacks throw", async () => {
+  it("streams background callbacks without surfacing handler errors", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation((input) => {
       const path = requestUrl(input);
-      if (path.endsWith("/v1/sandboxes/sbx_123/commands/start")) {
+      if (path.endsWith("/v1/sandboxes/sbx_123/commands")) {
         return Promise.resolve(commandResponse("running"));
       }
       if (path.endsWith("/v1/commands/cmd_123/stream")) {
@@ -162,13 +164,18 @@ function registerCommandCallbackTests() {
     });
 
     await expect(
-      client.commands.start("sbx_123", "npm test", {
+      client.commands.run("sbx_123", "npm test", {
+        background: true,
         onStreamError: () => {
           throw new Error("handler failed");
         },
         onStdout: () => undefined,
       }),
     ).resolves.toMatchObject({ id: "cmd_123", status: "running" });
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toEqual({
+      background: true,
+      command: "npm test",
+    });
   });
 }
 
@@ -177,7 +184,7 @@ function registerCommandCollectionCallbackTests() {
     const stdout = vi.fn();
     const fetchMock = vi.fn<typeof fetch>().mockImplementation((input) => {
       const path = requestUrl(input);
-      if (path.endsWith("/v1/sandboxes/sbx_123/commands/run")) {
+      if (path.endsWith("/v1/sandboxes/sbx_123/commands")) {
         return Promise.resolve(
           jsonResponse({
             command: { ...terminalCommand(), collectStatus: "succeeded" },
@@ -204,7 +211,7 @@ function registerCommandCollectionCallbackTests() {
     ).resolves.toMatchObject({ collectStatus: "succeeded", id: "cmd_123" });
     expect(stdout).toHaveBeenCalledWith("collected\n");
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      "https://api.test/v1/sandboxes/sbx_123/commands/run",
+      "https://api.test/v1/sandboxes/sbx_123/commands",
     );
     expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toMatchObject({
       _crownestRequireCommandRead: true,
@@ -428,3 +435,5 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
   });
 }
+
+/* eslint-enable max-lines -- End grouped SDK parity cases. */

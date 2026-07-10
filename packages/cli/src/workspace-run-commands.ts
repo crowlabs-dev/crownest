@@ -11,6 +11,7 @@ import type {
   WorkspaceRunsClient,
 } from "@crownest/sdk";
 
+import { apiGet } from "./api-request";
 import { CLI_EXIT_API_ERROR, CLI_EXIT_OK } from "./exit-codes";
 import {
   booleanFlag,
@@ -23,10 +24,19 @@ import {
   stringFlag,
   UsageError,
 } from "./flags";
-import type { CliOutput, CliResult } from "./index";
-import { jsonEnvelope, renderList, renderRecord } from "./output";
+import type { CliEnvironment, CliOutput, CliResult } from "./index";
+import { jsonEnvelope, jsonPageEnvelope, renderList, renderRecord } from "./output";
+import {
+  collectPages,
+  type Page,
+  paginationFlagSpec,
+  paginationOptions,
+  paginationSearchParams,
+} from "./pagination";
 
 type WorkspaceRunCommandOptions = {
+  readonly environment?: CliEnvironment | undefined;
+  readonly fetchImpl?: typeof fetch | undefined;
   readonly output?: CliOutput | undefined;
 };
 
@@ -54,7 +64,7 @@ export async function workspaceRunCommand(
     case "evidence":
       return evidenceWorkspaceRun(client, args);
     case "list":
-      return listWorkspaceRuns(client, args);
+      return listWorkspaceRuns(client, args, options);
     case "logs":
       return logsWorkspaceRun(client, args, options.output);
     case "run-archive":
@@ -124,27 +134,36 @@ async function evidenceWorkspaceRun(
 }
 
 async function listWorkspaceRuns(
-  client: () => CrowNestClient,
+  _client: () => CrowNestClient,
   args: readonly string[],
+  commandOptions: WorkspaceRunCommandOptions,
 ): Promise<CliResult> {
   const parsed = parseFlags(args, {
+    ...paginationFlagSpec,
     "--project": "string",
     "--status": "string",
     ...jsonFlagSpec,
   });
   rejectExtraPositionals(parsed.positionals, "workspace-runs list");
-  const runs = await client().workspaceRuns.list({
-    ...(stringFlag(parsed.flags, "--project") === undefined
-      ? {}
-      : { projectId: stringFlag(parsed.flags, "--project") as `prj_${string}` }),
-    ...(stringFlag(parsed.flags, "--status") === undefined
-      ? {}
-      : { status: stringFlag(parsed.flags, "--status") as never }),
+  const environment = commandOptions.environment ?? {};
+  const options = paginationOptions(parsed.flags);
+  const runsPage = await collectPages(options, async (cursor) => {
+    const params = paginationSearchParams(options, cursor);
+    const projectId = stringFlag(parsed.flags, "--project");
+    const status = stringFlag(parsed.flags, "--status");
+    if (projectId !== undefined) params.set("projectId", projectId);
+    if (status !== undefined) params.set("status", status);
+    const query = params.toString();
+    return await apiGet<Page<Record<string, unknown>>>(
+      environment,
+      commandOptions.fetchImpl,
+      `/v1/workspace-runs${query.length === 0 ? "" : `?${query}`}`,
+    );
   });
   return ok(
     booleanFlag(parsed.flags, "--json")
-      ? jsonEnvelope(runs)
-      : renderList(runs, [
+      ? jsonPageEnvelope(runsPage)
+      : renderList(runsPage.data, [
           { key: "id" },
           { key: "status" },
           { key: "templateSlug", label: "template" },
@@ -203,12 +222,16 @@ async function runArchiveWorkspaceRun(
   const command = split.command.map(shellEscapeArg).join(" ");
   const archive = await readArchiveFile(archivePath);
   const runs = client().workspaceRuns;
-  const run = await runs.create({
+  const run = await runs.runArchive({
+    archive: {
+      body: fileBody(archive.path),
+      headers: { "content-length": String(archive.sizeBytes) },
+      sha256: archive.sha256,
+      sizeBytes: archive.sizeBytes,
+    },
     ...createInput(parsed),
     command,
   });
-  await uploadArchive(runs, run.id, archive);
-  await runs.start(run.id);
   return collectWorkspaceRunEvents(
     runs,
     run.id,

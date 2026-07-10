@@ -1,5 +1,6 @@
 import type { CodeLanguage, CrowNestClient } from "@crownest/sdk";
 
+import { apiPost } from "./api-request";
 import {
   type CodeExecutionError,
   renderCodeOutput,
@@ -15,7 +16,18 @@ import {
   stringFlag,
   UsageError,
 } from "./flags";
-import type { CliInput, CliOutput, CliResult } from "./index";
+import type { CliEnvironment, CliInput, CliOutput, CliResult } from "./index";
+
+type ShellCommandOptions = {
+  readonly environment: CliEnvironment;
+  readonly fetchImpl?: typeof fetch | undefined;
+};
+
+type BashCommandResult = {
+  readonly exitCode?: number;
+  readonly stderr?: string;
+  readonly stdout?: string;
+};
 
 type ShellWriter = {
   readonly result: () => CliResult;
@@ -40,6 +52,7 @@ export async function shellCommand(
   args: readonly string[],
   input: CliInput | undefined,
   output?: CliOutput,
+  options?: ShellCommandOptions,
 ): Promise<CliResult> {
   const parsed = parseFlags(args, {
     "--bash": "boolean",
@@ -56,7 +69,10 @@ export async function shellCommand(
     if (stringFlag(parsed.flags, "--lang") !== undefined) {
       throw new UsageError("--lang cannot be used with --bash.");
     }
-    return await bashShell(client, sandboxId, input, output);
+    if (options === undefined) {
+      throw new Error("CLI environment is required for bash shell commands.");
+    }
+    return await bashShell(sandboxId, input, output, options);
   }
 
   return await codeShell(
@@ -109,10 +125,10 @@ async function codeShell(
 }
 
 async function bashShell(
-  client: () => CrowNestClient,
   sandboxId: `sbx_${string}`,
   input: CliInput | undefined,
-  output?: CliOutput,
+  output: CliOutput | undefined,
+  options: ShellCommandOptions,
 ): Promise<CliResult> {
   const writer = createShellWriter(output);
 
@@ -125,7 +141,13 @@ async function bashShell(
     const line = stripLineEnding(rawLine);
     if (isExitLine(line)) break;
     if (line.trim().length > 0) {
-      const command = await client().commands.run(sandboxId, line);
+      const response = await apiPost<{ readonly command: BashCommandResult }>(
+        options.environment,
+        options.fetchImpl,
+        `/v1/sandboxes/${sandboxId}/commands`,
+        { command: line },
+      );
+      const command = response.command;
       if (command.stdout) writer.stdout(command.stdout);
       if (command.stderr) writer.stderr(command.stderr);
       if (command.exitCode !== undefined && command.exitCode !== 0) {

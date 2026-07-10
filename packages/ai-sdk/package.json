@@ -49,6 +49,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node ../../scripts/rewrite-dts-extensions.mjs dist && esbuild src/index.ts --bundle --platform=neutral --format=esm --target=es2022 --external:@crownest/sdk --external:ai --external:zod --external:zod/* --outfile=dist/index.js",
+    "lint": "eslint --max-warnings=0 .",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -61,7 +62,7 @@
   },
   "devDependencies": {
     "ai": "^6.0.0",
-    "esbuild": "^0.28.0",
+    "esbuild": "catalog:",
     "vitest": "^4.1.6"
   }
 }

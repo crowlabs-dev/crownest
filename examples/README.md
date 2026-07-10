@@ -1,6 +1,6 @@
-# CrowNest public client examples
+# CrowNest examples
 
-These examples show the shortest agent-operable paths in this public clients repository.
+Use these entry points when an agent needs a working path quickly.
 
 ## CLI
 
@@ -21,8 +21,7 @@ const client = createCrowNestClient({
 });
 
 const sandbox = await client.sandboxes.create();
-await client.commands.run(sandbox.id, {
-  command: "python --version",
+await client.commands.run(sandbox.id, "python --version", {
   idempotencyKey: "example-python-version",
 });
 ```
@@ -43,4 +42,5 @@ await client.commands.run(sandbox.id, {
 }
 ```
 
-Discovery starts at https://api.crownest.dev/.well-known/api-catalog.
+The API contract is available at `https://api.crownest.dev/openapi.json`, and
+discovery starts at `https://api.crownest.dev/.well-known/api-catalog`.

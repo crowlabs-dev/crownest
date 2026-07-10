@@ -78,8 +78,8 @@ type CrownestCodeRunResult = {
   readonly language: "python" | "javascript" | "typescript";
   readonly outputs: readonly CrownestCodeOutput[];
   readonly sandboxId: `sbx_${string}`;
-  readonly stderr: readonly string[];
-  readonly stdout: readonly string[];
+  readonly stderr: string;
+  readonly stdout: string;
 };
 
 type CrownestCodeOutput =

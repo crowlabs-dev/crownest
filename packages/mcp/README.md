@@ -51,7 +51,7 @@ It lazily creates one default Sandbox on the first stateful tool call. Tools tha
 | `run_code`            | Runs Python code in a Sandbox. Variables and imports persist in the Code Context. Outputs are promoted to Artifacts when possible. |
 | `list_code_contexts`  | Lists live Code Contexts in a Sandbox.                                                                                             |
 | `get_code_context`    | Inspects a live Code Context in a Sandbox.                                                                                         |
-| `run_command`         | Runs a Command in a Sandbox and returns `command_id`, `sandbox_id`, exit code, stdout, and stderr.                                 |
+| `run_command`         | Runs a Command in the foreground by default, or starts it immediately with `background: true` for follow-up through Command tools. |
 | `get_command`         | Inspects Command status, exit code, and timing by Command id.                                                                      |
 | `cancel_command`      | Cancels a Command by Command id with graceful or force mode.                                                                       |
 | `stream_command_logs` | Reads the currently available bounded Command log buffer.                                                                          |
@@ -59,7 +59,7 @@ It lazily creates one default Sandbox on the first stateful tool call. Tools tha
 | `list_sandboxes`      | Lists live Sandboxes visible to the configured API Key, with optional live status filtering and limit.                             |
 | `get_usage`           | Reads compute usage, spend metadata, quota buckets, and MCP-session Sandbox state.                                                 |
 | `get_sandbox`         | Inspects a Sandbox by id or the current lazy default Sandbox.                                                                      |
-| `extend_sandbox`      | Resets a live Sandbox TTL from now.                                                                                                |
+| `set_sandbox_ttl`     | Resets the TTL countdown from now to `ttl_ms`; it does not add `ttl_ms` to the existing expiry.                                    |
 | `kill_sandbox`        | Kills a server-created Sandbox. If it was the default Sandbox, the next default call creates a new one.                            |
 | `write_file`          | Writes utf-8 text to a Workspace path, normally under `/workspace`.                                                                |
 | `read_file`           | Reads utf-8 text from a Workspace path.                                                                                            |

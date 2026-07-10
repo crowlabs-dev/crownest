@@ -45,7 +45,11 @@ function mockWorkspaceRunLifecycle(
   });
   client.mocks.startWorkspaceRun.mockResolvedValueOnce({ ...run, status: "running" });
   client.mocks.getWorkspaceRun.mockResolvedValueOnce(run);
-  client.mocks.listWorkspaceRuns.mockResolvedValueOnce([run]);
+  client.mocks.listWorkspaceRuns.mockResolvedValueOnce({
+    data: [run],
+    hasMore: true,
+    nextCursor: "workspace_run_cursor",
+  });
   client.mocks.listWorkspaceRunEvents.mockResolvedValueOnce(workspaceRunEvents());
   client.mocks.cancelWorkspaceRun.mockResolvedValueOnce({
     ...run,
@@ -89,6 +93,8 @@ async function callWorkspaceRunTools(tools: ReturnType<typeof createHarness>["to
       workspace_run_id: "wsr_123",
     }),
     list: await callTool(tools, "list_workspace_runs", {
+      cursor: "workspace_run_input_cursor",
+      limit: 25,
       metadata: { agent: "codex" },
       project_id: "prj_123",
       status: "running",
@@ -157,6 +163,8 @@ function expectWorkspaceRunSdkCalls(
   });
   expect(client.mocks.getWorkspaceRun).toHaveBeenCalledWith("wsr_123");
   expect(client.mocks.listWorkspaceRuns).toHaveBeenCalledWith({
+    cursor: "workspace_run_input_cursor",
+    limit: 25,
     metadata: { agent: "codex" },
     projectId: "prj_123",
     status: "running",
@@ -183,6 +191,8 @@ function expectWorkspaceRunToolResults(
   expect(text(results.started)).toContain('"status": "running"');
   expect(text(results.get)).toContain('"id": "wsr_123"');
   expect(text(results.list)).toContain('"id": "wsr_123"');
+  expect(text(results.list)).toContain('"has_more": true');
+  expect(text(results.list)).toContain('"next_cursor": "workspace_run_cursor"');
   expect(text(results.events)).toContain('"nextSeq": 2');
   expect(text(results.canceled)).toContain('"status": "canceled"');
   expect(text(results.evidenceResult)).toContain('"workspaceRunId": "wsr_123"');

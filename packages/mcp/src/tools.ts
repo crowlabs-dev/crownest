@@ -27,7 +27,6 @@ import {
   registerCancelCommand,
   registerGetCommand,
   registerRunCommand,
-  registerStartCommand,
   registerStreamCommandLogs,
 } from "./tools/commands";
 import { registerGetAgentContext } from "./tools/context";
@@ -51,10 +50,10 @@ import {
 } from "./tools/previews";
 import {
   registerCreateSandbox,
-  registerExtendSandbox,
   registerGetSandbox,
   registerKillSandbox,
   registerListSandboxes,
+  registerSetSandboxTtl,
 } from "./tools/sandboxes";
 import type { ToolRegistrar } from "./tools/shared";
 import { registerGetUsage } from "./tools/usage";
@@ -76,7 +75,6 @@ const toolRegistrars = [
   registerRunCode,
   registerGetAgentContext,
   registerRunCommand,
-  registerStartCommand,
   registerCreateSandbox,
   registerKillSandbox,
   registerWriteFile,
@@ -90,7 +88,7 @@ const toolRegistrars = [
   registerListSandboxes,
   registerGetUsage,
   registerGetSandbox,
-  registerExtendSandbox,
+  registerSetSandboxTtl,
   registerGetCommand,
   registerCancelCommand,
   registerStreamCommandLogs,

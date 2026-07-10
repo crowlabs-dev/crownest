@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 
 import httpx
 import pytest
 
 from crownest import _resources as resources
-from crownest import AsyncCrowNest, CrowNest, CrowNestApiError
+from crownest import AsyncCrowNest, CrowNest, CrowNestApiError, SandboxHandle
 from crownest._transport import (
     DEFAULT_TIMEOUT_SECONDS,
     MAX_BLOCKING_COMMAND_TIMEOUT_SECONDS,
@@ -21,9 +22,9 @@ def test_sync_client_creates_sandbox_handle_and_runs_command() -> None:
         requests.append(request)
         if request.url.path == "/v1/sandboxes":
             return json_response({"sandbox": sandbox_body()})
-        if request.url.path == "/v1/sandboxes/sbx_123/extend":
+        if request.url.path == "/v1/sandboxes/sbx_123/ttl":
             return json_response({"sandbox": sandbox_body(ttlMs=5_400_000)})
-        if request.url.path == "/v1/sandboxes/sbx_123/commands/run":
+        if request.url.path == "/v1/sandboxes/sbx_123/commands":
             return json_response({"command": command_body()})
         if request.url.path == "/v1/commands/cmd_123/cancel":
             return json_response({"command": command_body(status="canceled")})
@@ -36,7 +37,7 @@ def test_sync_client_creates_sandbox_handle_and_runs_command() -> None:
     )
 
     sandbox = client.sandboxes.create(project_id="prj_123", template="python-node")
-    extended = sandbox.extend(ttl_ms=5_400_000, idempotency_key="extend-key")
+    extended = sandbox.set_ttl(ttl_ms=5_400_000, idempotency_key="ttl-key")
     command = extended.commands.run(
         "python main.py",
         collect=[{"path": "/workspace/output.txt", "name": "output.txt"}],
@@ -55,9 +56,10 @@ def test_sync_client_creates_sandbox_handle_and_runs_command() -> None:
         "projectId": "prj_123",
         "template": "python-node",
     }
-    assert requests[1].headers["idempotency-key"] == "extend-key"
+    assert requests[1].headers["idempotency-key"] == "ttl-key"
     assert json.loads(requests[1].content) == {"ttlMs": 5_400_000}
     assert json.loads(requests[2].content) == {
+        "background": False,
         "collect": [{"path": "/workspace/output.txt", "name": "output.txt"}],
         "collectOn": "success",
         "command": "python main.py",
@@ -77,9 +79,7 @@ def test_owned_http_clients_allow_max_blocking_command_timeout() -> None:
             DEFAULT_TIMEOUT_SECONDS
         )
         assert short_timeout_client._transport._client.timeout == httpx.Timeout(30)
-        assert async_client._transport._client.timeout == httpx.Timeout(
-            45
-        )
+        assert async_client._transport._client.timeout == httpx.Timeout(45)
     finally:
         sync_client.close()
         short_timeout_client.close()
@@ -93,9 +93,9 @@ def test_caller_provided_idempotency_keys_are_sent_and_removed_from_body() -> No
         requests.append(request)
         if request.url.path == "/v1/sandboxes":
             return json_response({"sandbox": sandbox_body()})
-        if request.url.path == "/v1/sandboxes/sbx_123/extend":
+        if request.url.path == "/v1/sandboxes/sbx_123/ttl":
             return json_response({"sandbox": sandbox_body(ttlMs=5_400_000)})
-        if request.url.path == "/v1/sandboxes/sbx_123/commands/run":
+        if request.url.path == "/v1/sandboxes/sbx_123/commands":
             return json_response({"command": command_body()})
         if request.url.path == "/v1/sandboxes/sbx_123/artifacts":
             return json_response({"artifact": artifact_body()})
@@ -108,10 +108,10 @@ def test_caller_provided_idempotency_keys_are_sent_and_removed_from_body() -> No
     )
 
     client.sandboxes.create(idempotency_key="create-key", project_id="prj_123")
-    client.sandboxes.extend(
+    client.sandboxes.set_ttl(
         "sbx_123",
         ttl_ms=5_400_000,
-        idempotency_key="extend-key",
+        idempotency_key="ttl-key",
     )
     client.commands.run("sbx_123", "python main.py", idempotency_key="run-key")
     client.artifacts.create(
@@ -122,12 +122,257 @@ def test_caller_provided_idempotency_keys_are_sent_and_removed_from_body() -> No
 
     assert requests[0].headers["idempotency-key"] == "create-key"
     assert json.loads(requests[0].content) == {"projectId": "prj_123"}
-    assert requests[1].headers["idempotency-key"] == "extend-key"
+    assert requests[1].headers["idempotency-key"] == "ttl-key"
     assert json.loads(requests[1].content) == {"ttlMs": 5_400_000}
     assert requests[2].headers["idempotency-key"] == "run-key"
-    assert json.loads(requests[2].content) == {"command": "python main.py"}
+    assert json.loads(requests[2].content) == {
+        "background": False,
+        "command": "python main.py",
+    }
     assert requests[3].headers["idempotency-key"] == "artifact-key"
     assert json.loads(requests[3].content) == {"path": "/workspace/output.txt"}
+
+
+def test_python_command_methods_reject_unknown_keyword_options() -> None:
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(lambda _request: json_response({}))
+        ),
+    )
+
+    with pytest.raises(TypeError, match="timeout_millis"):
+        client.commands.run("sbx_123", "python main.py", timeout_millis=1)  # type: ignore[call-arg]
+
+    sandbox = SandboxHandle(sandbox_body(), client._transport)
+    with pytest.raises(TypeError, match="timeout_millis"):
+        sandbox.commands.run("python main.py", timeout_millis=1)  # type: ignore[call-arg]
+
+
+def test_command_and_ttl_clean_break_surfaces() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sandboxes/sbx_123/commands":
+            return json_response({"command": command_body(status="running")})
+        if request.url.path == "/v1/sandboxes/sbx_123/ttl":
+            return json_response({"sandbox": sandbox_body(ttlMs=120_000)})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    sandbox = SandboxHandle(sandbox_body(), client._transport)
+
+    background = sandbox.commands.run("python worker.py", background=True)
+    updated = client.sandboxes.set_ttl("sbx_123", ttl_ms=120_000)
+
+    assert background["status"] == "running"
+    assert updated["ttlMs"] == 120_000
+    assert json.loads(requests[0].content) == {
+        "background": True,
+        "command": "python worker.py",
+    }
+    assert json.loads(requests[1].content) == {"ttlMs": 120_000}
+    assert not hasattr(client.commands, "start")
+    assert not hasattr(sandbox.commands, "start")
+    assert not hasattr(client.sandboxes, "extend")
+    assert not hasattr(sandbox, "extend")
+
+    with pytest.raises(ValueError, match="background=False"):
+        client.commands.run(
+            "sbx_123",
+            "python worker.py",
+            background=True,
+            collect=[{"path": "/workspace/output.txt"}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_async_background_command_and_set_ttl_use_canonical_routes() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sandboxes/sbx_123/commands":
+            return json_response({"command": command_body(status="running")})
+        if request.url.path == "/v1/sandboxes/sbx_123/ttl":
+            return json_response({"sandbox": sandbox_body(ttlMs=120_000)})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with AsyncCrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        command = await client.commands.run(
+            "sbx_123", "python worker.py", background=True
+        )
+        sandbox = await client.sandboxes.set_ttl("sbx_123", ttl_ms=120_000)
+        assert not hasattr(client.commands, "start")
+        assert not hasattr(client.sandboxes, "extend")
+
+    assert command["status"] == "running"
+    assert sandbox["ttlMs"] == 120_000
+    assert json.loads(requests[0].content) == {
+        "background": True,
+        "command": "python worker.py",
+    }
+
+
+def test_sync_background_command_preserves_callback_streaming() -> None:
+    stdout: list[str] = []
+    received = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sandboxes/sbx_123/commands":
+            assert json.loads(request.content) == {
+                "background": True,
+                "command": "python worker.py",
+            }
+            return json_response({"command": command_body(status="running")})
+        if request.url.path == "/v1/commands/cmd_123/stream":
+            return httpx.Response(
+                200,
+                content=(
+                    b'data: {"type":"log","seq":1,"stream":"stdout",'
+                    b'"data":"ready\\n","createdAt":"now"}\n\n'
+                    b'data: {"type":"terminal","createdAt":"now","command":'
+                    + json.dumps(command_body()).encode()
+                    + b"}\n\n"
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    def on_stdout(chunk: str) -> None:
+        stdout.append(chunk)
+        received.set()
+
+    command = client.commands.run(
+        "sbx_123",
+        "python worker.py",
+        background=True,
+        on_stdout=on_stdout,
+    )
+
+    assert command["status"] == "running"
+    assert received.wait(timeout=1)
+    assert stdout == ["ready\n"]
+
+
+@pytest.mark.asyncio
+async def test_async_background_command_preserves_callback_streaming() -> None:
+    stdout: list[str] = []
+    received = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sandboxes/sbx_123/commands":
+            return json_response({"command": command_body(status="running")})
+        if request.url.path == "/v1/commands/cmd_123/stream":
+            return httpx.Response(
+                200,
+                content=(
+                    b'data: {"type":"log","seq":1,"stream":"stdout",'
+                    b'"data":"ready\\n","createdAt":"now"}\n\n'
+                    b'data: {"type":"terminal","createdAt":"now","command":'
+                    + json.dumps(command_body()).encode()
+                    + b"}\n\n"
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with AsyncCrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+
+        def on_stdout(chunk: str) -> None:
+            stdout.append(chunk)
+            received.set()
+
+        command = await client.commands.run(
+            "sbx_123",
+            "python worker.py",
+            background=True,
+            on_stdout=on_stdout,
+        )
+        await asyncio.wait_for(received.wait(), timeout=1)
+
+    assert command["status"] == "running"
+    assert stdout == ["ready\n"]
+
+
+def test_sync_client_retries_retryable_idempotent_request() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return json_response(
+                {"error": {"code": "slow_down", "message": "Try again."}},
+                headers={"retry-after": "0"},
+                status_code=503,
+            )
+        return json_response({"sandbox": sandbox_body()})
+
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=1,
+    )
+
+    sandbox = client.sandboxes.create()
+
+    assert sandbox["id"] == "sbx_123"
+    assert len(requests) == 2
+    assert requests[0].headers["idempotency-key"]
+    assert (
+        requests[1].headers["idempotency-key"] == requests[0].headers["idempotency-key"]
+    )
+    assert requests[0].headers["user-agent"].startswith("crownest-python/")
+    assert requests[0].headers["x-crownest-sdk"].startswith("crownest-python/")
+
+
+def test_sync_client_does_not_retry_non_idempotent_mutations() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response(
+            {"error": {"code": "slow_down", "message": "Try again."}},
+            headers={"retry-after": "0"},
+            status_code=503,
+        )
+
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=1,
+    )
+
+    with pytest.raises(CrowNestApiError) as failure:
+        client.commands.cancel("cmd_123")
+
+    assert failure.value.code == "slow_down"
+    assert failure.value.retry_after_seconds == 0
+    assert failure.value.retryable is True
+    assert failure.value.status == 503
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
@@ -138,7 +383,7 @@ async def test_async_client_extends_sandbox_handles() -> None:
         requests.append(request)
         if request.url.path == "/v1/sandboxes":
             return json_response({"sandbox": sandbox_body()})
-        if request.url.path == "/v1/sandboxes/sbx_123/extend":
+        if request.url.path == "/v1/sandboxes/sbx_123/ttl":
             return json_response({"sandbox": sandbox_body(ttlMs=5_400_000)})
         if request.url.path == "/v1/commands/cmd_123/cancel":
             return json_response({"command": command_body(status="canceled")})
@@ -150,15 +395,15 @@ async def test_async_client_extends_sandbox_handles() -> None:
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     ) as client:
         sandbox = await client.sandboxes.create(project_id="prj_123")
-        extended = await sandbox.extend(
+        extended = await sandbox.set_ttl(
             ttl_ms=5_400_000,
-            idempotency_key="async-extend-key",
+            idempotency_key="async-ttl-key",
         )
         canceled = await extended.commands.cancel("cmd_123", mode="force")
 
     assert extended["ttlMs"] == 5_400_000
     assert canceled["status"] == "canceled"
-    assert requests[1].headers["idempotency-key"] == "async-extend-key"
+    assert requests[1].headers["idempotency-key"] == "async-ttl-key"
     assert json.loads(requests[1].content) == {"ttlMs": 5_400_000}
     assert requests[2].url.path == "/v1/commands/cmd_123/cancel"
     assert json.loads(requests[2].content) == {"mode": "force"}
@@ -216,13 +461,17 @@ def test_file_artifact_project_preview_and_download_routes() -> None:
     assert client.files.write("sbx_123", "/workspace/input.txt", "hello")["path"]
     assert client.files.read("sbx_123", "/workspace/input.txt") == "hello"
     assert client.files.mkdir("sbx_123", "/workspace/data", parents=True)["type"]
-    assert client.files.move("sbx_123", "/workspace/input.txt", "/workspace/renamed.txt")
+    assert client.files.move(
+        "sbx_123", "/workspace/input.txt", "/workspace/renamed.txt"
+    )
     assert client.files.stat("sbx_123", "/workspace/input.txt")["sizeBytes"] == 5
-    assert client.files.download_url("sbx_123", "/workspace/input.txt")["method"] == "GET"
-    assert client.artifacts.list("sbx_123")[0]["id"] == "art_123"
+    assert (
+        client.files.download_url("sbx_123", "/workspace/input.txt")["method"] == "GET"
+    )
+    assert client.artifacts.list("sbx_123")["data"][0]["id"] == "art_123"
     assert client.artifacts.download_url("art_123")["method"] == "GET"
     assert client.artifacts.download("art_123") == b"artifact-bytes"
-    assert client.projects.list()[0]["id"] == "prj_123"
+    assert client.projects.list()["data"][0]["id"] == "prj_123"
     assert client.projects.create(name="Agent Workspace")["id"] == "prj_created"
     preview_create = client.previews.create("sbx_123", port=8080, auth_mode="token")
     assert preview_create["preview"]["id"] == "prv_123"
@@ -259,18 +508,88 @@ def test_sync_crud_completion_routes() -> None:
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 
-    assert client.api_keys.list()[0]["id"] == "key_123"
+    assert client.api_keys.list()["data"][0]["id"] == "key_123"
     assert client.api_keys.get("key_123")["id"] == "key_123"
     assert client.api_keys.revoke("key_123")["id"] == "key_123"
     assert client.projects.create(name="Agent Workspace")["id"] == "prj_created"
-    assert client.code.list_contexts("sbx_123")[0]["id"] == "cctx_123"
+    assert client.code.list_contexts("sbx_123")["data"][0]["id"] == "cctx_123"
     assert client.code.get_context("sbx_123", "cctx_123")["id"] == "cctx_123"
     sandbox = client.sandboxes.get("sbx_123")
-    assert sandbox.code.list_contexts()[0]["id"] == "cctx_123"
+    assert sandbox.code.list_contexts()["data"][0]["id"] == "cctx_123"
     assert sandbox.code.get_context("cctx_123")["id"] == "cctx_123"
 
-    assert [request.method for request in requests[:4]] == ["GET", "GET", "DELETE", "POST"]
+    assert [request.method for request in requests[:4]] == [
+        "GET",
+        "GET",
+        "DELETE",
+        "POST",
+    ]
     assert json.loads(requests[3].content) == {"name": "Agent Workspace"}
+
+
+def test_sync_sandbox_handles_expose_symmetric_helpers() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/sandboxes" and request.method == "GET":
+            return json_response(
+                {"data": [sandbox_body(status="creating")], "hasMore": False}
+            )
+        if path == "/v1/sandboxes/sbx_123" and request.method == "DELETE":
+            return json_response({"sandbox": sandbox_body(status="destroyed")})
+        if path == "/v1/sandboxes/sbx_123" and request.method == "GET":
+            return json_response({"sandbox": sandbox_body(status="ready")})
+        if path == "/v1/commands/cmd_123":
+            return json_response({"command": command_body(status="running")})
+        if path == "/v1/commands/cmd_123/logs":
+            return json_response(
+                {
+                    "data": [
+                        {
+                            "commandId": "cmd_123",
+                            "createdAt": "now",
+                            "data": "ready\n",
+                            "seq": 1,
+                            "stream": "stdout",
+                        }
+                    ],
+                    "hasMore": False,
+                }
+            )
+        if path == "/v1/artifacts/art_123":
+            return json_response({"artifact": artifact_body()})
+        if path == "/v1/artifacts/art_123/download-url":
+            return json_response(
+                {"authMode": "api_key", "method": "GET", "url": "https://download"}
+            )
+        if path == "/v1/artifacts/art_123/download":
+            return httpx.Response(200, content=b"artifact-bytes")
+        if path == "/v1/previews/prv_123":
+            return json_response({"preview": preview_body(auth_mode="token")})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    listed = client.sandboxes.list()["data"][0]
+    assert listed.commands.get("cmd_123")["status"] == "running"
+    assert listed.commands.logs("cmd_123")["data"][0]["seq"] == 1
+    assert listed.artifacts.get("art_123")["id"] == "art_123"
+    assert listed.artifacts.download_url("art_123")["method"] == "GET"
+    assert listed.artifacts.download("art_123") == b"artifact-bytes"
+    assert listed.artifacts.delete("art_123")["id"] == "art_123"
+    assert listed.previews.get("prv_123")["authMode"] == "token"
+    assert listed.previews.revoke("prv_123")["id"] == "prv_123"
+    assert (
+        listed.wait_until_ready(interval_seconds=0, timeout_seconds=1)["status"]
+        == "ready"
+    )
+    assert client.sandboxes.kill("sbx_123").status == "destroyed"
 
 
 @pytest.mark.asyncio
@@ -301,17 +620,29 @@ async def test_async_crud_completion_routes() -> None:
         base_url="https://api.test",
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     ) as client:
-        assert (await client.api_keys.list())[0]["id"] == "key_123"
+        assert (await client.api_keys.list())["data"][0]["id"] == "key_123"
         assert (await client.api_keys.get("key_123"))["id"] == "key_123"
         assert (await client.api_keys.revoke("key_123"))["id"] == "key_123"
-        assert (await client.projects.create(name="Agent Workspace"))["id"] == "prj_created"
-        assert (await client.code.list_contexts("sbx_123"))[0]["id"] == "cctx_123"
-        assert (await client.code.get_context("sbx_123", "cctx_123"))["id"] == "cctx_123"
+        assert (await client.projects.create(name="Agent Workspace"))[
+            "id"
+        ] == "prj_created"
+        assert (await client.code.list_contexts("sbx_123"))["data"][0][
+            "id"
+        ] == "cctx_123"
+        assert (await client.code.get_context("sbx_123", "cctx_123"))[
+            "id"
+        ] == "cctx_123"
         sandbox = await client.sandboxes.get("sbx_123")
-        assert (await sandbox.code.list_contexts())[0]["id"] == "cctx_123"
+        assert (await sandbox.code.list_contexts())["data"][0]["id"] == "cctx_123"
         assert (await sandbox.code.get_context("cctx_123"))["id"] == "cctx_123"
 
-    assert [request.method for request in requests[:4]] == ["GET", "GET", "DELETE", "POST"]
+    assert [request.method for request in requests[:4]] == [
+        "GET",
+        "GET",
+        "DELETE",
+        "POST",
+    ]
+
 
 @pytest.mark.asyncio
 async def test_async_preview_create_returns_token_envelope() -> None:
@@ -321,7 +652,10 @@ async def test_async_preview_create_returns_token_envelope() -> None:
         requests.append(request)
         if request.url.path == "/v1/sandboxes/sbx_123/previews":
             return json_response(
-                {"preview": preview_body(auth_mode="token"), "previewToken": "pvt_async"}
+                {
+                    "preview": preview_body(auth_mode="token"),
+                    "previewToken": "pvt_async",
+                }
             )
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
@@ -373,7 +707,10 @@ def test_usage_metadata_filters_and_byte_helpers() -> None:
     )
 
     assert client.usage()["computeUnitSeconds"]["used"] == 42
-    assert client.sandboxes.list(metadata={"agent.id": "codex/1"})[0]["id"] == "sbx_123"
+    assert (
+        client.sandboxes.list(metadata={"agent.id": "codex/1"})["data"][0]["id"]
+        == "sbx_123"
+    )
     assert client.files.write_bytes("sbx_123", "/workspace/blob.bin", b"\x00\xff\x10")[
         "path"
     ]
@@ -663,8 +1000,9 @@ async def test_async_root_code_client_routes() -> None:
 
 def test_env_api_key_fallback_and_fail_fast(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CROWNEST_API_KEY", raising=False)
+    monkeypatch.delenv("CROWNEST_BEARER_TOKEN", raising=False)
 
-    with pytest.raises(ValueError, match="CROWNEST_API_KEY"):
+    with pytest.raises(ValueError, match="CROWNEST_BEARER_TOKEN"):
         CrowNest()
 
     requests: list[httpx.Request] = []
@@ -676,8 +1014,31 @@ def test_env_api_key_fallback_and_fail_fast(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("CROWNEST_API_KEY", "cnk_env")
     client = CrowNest(http_client=httpx.Client(transport=httpx.MockTransport(handler)))
 
-    assert client.sandboxes.list() == []
+    assert client.sandboxes.list() == {"data": [], "hasMore": False}
     assert requests[0].headers["authorization"] == "Bearer cnk_env"
+
+    requests.clear()
+    monkeypatch.setenv("CROWNEST_BEARER_TOKEN", "bearer_env")
+    client = CrowNest(http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    assert client.sandboxes.list() == {"data": [], "hasMore": False}
+    assert requests[0].headers["authorization"] == "Bearer bearer_env"
+
+
+def test_explicit_credential_alias_is_used_for_python_client() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response({"data": [], "hasMore": False})
+
+    client = CrowNest(
+        credential="bearer_option",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.sandboxes.list() == {"data": [], "hasMore": False}
+    assert requests[0].headers["authorization"] == "Bearer bearer_option"
 
 
 def test_non_json_errors_raise_structured_api_error() -> None:
@@ -699,6 +1060,163 @@ def test_non_json_errors_raise_structured_api_error() -> None:
 
     assert failure.value.status == 502
     assert failure.value.code == "invalid_error_response"
+
+
+def test_api_errors_capture_request_id_and_derive_retryability_from_code() -> None:
+    client = CrowNest(
+        api_key="cnk_test",
+        max_retries=0,
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _request: json_response(
+                    {
+                        "error": {
+                            "code": "idempotency_request_in_progress",
+                            "message": "Still processing.",
+                        }
+                    },
+                    headers={"x-request-id": "req_123"},
+                    status_code=409,
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(CrowNestApiError) as failure:
+        client.sandboxes.list()
+
+    assert failure.value.request_id == "req_123"
+    assert failure.value.retryable is True
+
+
+def test_sync_pages_expose_cursors_and_iterate_across_pages() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.params.get("cursor") == "next_1":
+            return json_response({"data": [sandbox_body(id="sbx_2")], "hasMore": False})
+        return json_response(
+            {
+                "data": [sandbox_body(id="sbx_1")],
+                "hasMore": True,
+                "nextCursor": "next_1",
+            }
+        )
+
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    page = client.sandboxes.list(limit=1)
+
+    assert page.data[0].id == "sbx_1"
+    assert page.has_more is True
+    assert page.next_cursor == "next_1"
+    assert [sandbox.id for sandbox in page] == ["sbx_1", "sbx_2"]
+    assert requests[0].url.params["limit"] == "1"
+    assert requests[1].url.params["cursor"] == "next_1"
+
+
+def test_sync_page_iteration_rejects_repeated_cursors() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            {
+                "data": [sandbox_body(id="sbx_1")],
+                "hasMore": True,
+                "nextCursor": "next_loop",
+            }
+        )
+
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    page = client.sandboxes.list(limit=1)
+
+    with pytest.raises(RuntimeError, match="repeated pagination cursor"):
+        list(page)
+
+
+@pytest.mark.asyncio
+async def test_async_page_iteration_rejects_repeated_cursors() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            {
+                "data": [project_body("prj_1")],
+                "hasMore": True,
+                "nextCursor": "next_loop",
+            }
+        )
+
+    async with AsyncCrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        page = await client.projects.list(limit=1)
+        with pytest.raises(RuntimeError, match="repeated pagination cursor"):
+            _ = [project async for project in page]
+
+
+@pytest.mark.asyncio
+async def test_async_pages_iterate_across_pages() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("cursor") == "next_1":
+            return json_response({"data": [project_body("prj_2")], "hasMore": False})
+        return json_response(
+            {
+                "data": [project_body("prj_1")],
+                "hasMore": True,
+                "nextCursor": "next_1",
+            }
+        )
+
+    async with AsyncCrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        page = await client.projects.list(limit=1)
+        project_ids = [project["id"] async for project in page]
+
+    assert project_ids == ["prj_1", "prj_2"]
+
+
+def test_workspace_run_convenience_uses_direct_upload_and_waits() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/workspace-runs":
+            return json_response({"workspaceRun": workspace_run_body()})
+        if request.url.path.endswith("/archive"):
+            return json_response(
+                {"workspaceRun": workspace_run_body("archive_uploaded")}
+            )
+        if request.url.path.endswith("/start"):
+            return json_response({"workspaceRun": workspace_run_body("running")})
+        if request.url.path.endswith("/wsr_123"):
+            return json_response({"workspaceRun": workspace_run_body("succeeded")})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    result = client.workspace_runs.run(b"archive", command="pytest -q")
+
+    assert result["status"] == "succeeded"
+    assert [request.url.path for request in requests] == [
+        "/v1/workspace-runs",
+        "/v1/workspace-runs/wsr_123/archive",
+        "/v1/workspace-runs/wsr_123/start",
+        "/v1/workspace-runs/wsr_123",
+    ]
+    assert requests[1].headers["x-crownest-archive-size"] == "7"
 
 
 def test_unexpected_json_error_envelopes_preserve_response_body() -> None:
@@ -872,7 +1390,7 @@ def test_sync_run_callbacks_dispatch_chunks_and_return_terminal_command() -> Non
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path == "/v1/sandboxes/sbx_123/commands/start":
+        if request.url.path == "/v1/sandboxes/sbx_123/commands":
             return json_response({"command": command_body(status="running")})
         if request.url.path == "/v1/commands/cmd_123/stream":
             return httpx.Response(
@@ -910,6 +1428,7 @@ def test_sync_run_callbacks_dispatch_chunks_and_return_terminal_command() -> Non
     assert stderr == ["err\n"]
     assert json.loads(requests[0].content) == {
         "_crownestRequireCommandRead": True,
+        "background": True,
         "command": "python main.py",
         "timeoutMs": 60_000,
     }
@@ -919,7 +1438,7 @@ def test_sync_run_callbacks_dispatch_chunks_and_return_terminal_command() -> Non
 
     def collect_handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path == "/v1/sandboxes/sbx_123/commands/run":
+        if request.url.path == "/v1/sandboxes/sbx_123/commands":
             return json_response(
                 {
                     "command": {
@@ -960,9 +1479,10 @@ def test_sync_run_callbacks_dispatch_chunks_and_return_terminal_command() -> Non
 
     assert collected["collectStatus"] == "succeeded"
     assert stdout == ["collected\n"]
-    assert requests[0].url.path == "/v1/sandboxes/sbx_123/commands/run"
+    assert requests[0].url.path == "/v1/sandboxes/sbx_123/commands"
     assert json.loads(requests[0].content) == {
         "_crownestRequireCommandRead": True,
+        "background": False,
         "collect": [{"path": "/workspace/output.txt"}],
         "collectOn": "always",
         "command": "python main.py",
@@ -1074,7 +1594,7 @@ async def test_async_client_surface_and_sse_stream() -> None:
             return json_response({"sandbox": sandbox_body()})
         if request.url.path == "/v1/sandboxes/sbx_123/files":
             return json_response({"file": file_body()})
-        if request.url.path == "/v1/sandboxes/sbx_123/commands/run":
+        if request.url.path == "/v1/sandboxes/sbx_123/commands":
             return json_response({"command": command_body()})
         if request.url.path == "/v1/commands/cmd_123/stream":
             return httpx.Response(
@@ -1089,7 +1609,7 @@ async def test_async_client_surface_and_sse_stream() -> None:
         base_url="https://api.test",
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     ) as client:
-        assert (await client.projects.list())[0]["id"] == "prj_123"
+        assert (await client.projects.list())["data"][0]["id"] == "prj_123"
         sandbox = await client.sandboxes.create(template="python-node")
         assert sandbox.id == "sbx_123"
         assert (await sandbox.files.write("/workspace/input.txt", "hello"))["path"]
@@ -1115,6 +1635,7 @@ async def test_async_client_surface_and_sse_stream() -> None:
     }
     assert requests[3].headers["idempotency-key"]
     assert json.loads(requests[3].content) == {
+        "background": False,
         "collect": [{"path": "/workspace/output.txt", "name": "output.txt"}],
         "collectOn": "success",
         "command": "python main.py",
@@ -1142,7 +1663,10 @@ def test_sync_workspace_run_routes_and_transfer_auth() -> None:
             return json_response({"transfer": transfer})
         if str(request.url) == transfer["uploadUrl"]:
             return httpx.Response(204)
-        if str(request.url) == "https://api.test/v1/workspace-runs/wsr_123/archive-transfer/upl_same":
+        if (
+            str(request.url)
+            == "https://api.test/v1/workspace-runs/wsr_123/archive-transfer/upl_same"
+        ):
             return httpx.Response(204)
         if path == "/v1/workspace-runs/wsr_123/archive/finalize":
             return json_response(
@@ -1186,7 +1710,9 @@ def test_sync_workspace_run_routes_and_transfer_auth() -> None:
                 }
             )
         if path == "/v1/workspace-runs/wsr_123/cancel":
-            return json_response({"workspaceRun": workspace_run_body(status="canceled")})
+            return json_response(
+                {"workspaceRun": workspace_run_body(status="canceled")}
+            )
         if path == "/v1/workspace-runs/wsr_123/evidence":
             return json_response({"evidence": workspace_run_evidence_body()})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
@@ -1254,7 +1780,7 @@ def test_sync_workspace_run_routes_and_transfer_auth() -> None:
     assert finalized["workspaceRun"]["status"] == "archive_uploaded"
     assert started["status"] == "running"
     assert got["id"] == "wsr_123"
-    assert listed[0]["id"] == "wsr_123"
+    assert listed["data"][0]["id"] == "wsr_123"
     assert events_page["nextSeq"] == 2
     assert [event["type"] for event in streamed] == ["status", "terminal"]
     assert canceled["status"] == "canceled"
@@ -1277,7 +1803,10 @@ def test_sync_workspace_run_routes_and_transfer_auth() -> None:
     assert requests[3].headers.get("authorization") is None
     assert requests[3].headers["x-upload-token"] == "token"
     assert requests[4].headers["authorization"] == "Bearer cnk_test"
-    assert requests[8].url.query == b"projectId=prj_123&status=running&metadata.agent=codex"
+    assert (
+        requests[8].url.query
+        == b"projectId=prj_123&status=running&metadata.agent=codex"
+    )
     assert requests[9].url.query == b"afterSeq=1&limit=10"
     assert requests[10].url.query == b"afterSeq=1&stream=true"
 
@@ -1303,6 +1832,58 @@ def test_sync_transfer_auth_normalizes_default_base_url_port() -> None:
     )
 
     assert requests[0].headers["authorization"] == "Bearer cnk_test"
+
+
+def test_sync_workspace_run_run_archive_helper() -> None:
+    requests: list[httpx.Request] = []
+    transfer = workspace_run_transfer("https://uploads.test/wsr_123/upl_123")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/workspace-runs" and request.method == "POST":
+            return json_response({"workspaceRun": workspace_run_body()})
+        if path == "/v1/workspace-runs/wsr_123/archive-transfer":
+            return json_response({"transfer": transfer})
+        if str(request.url) == transfer["uploadUrl"]:
+            return httpx.Response(204)
+        if path == "/v1/workspace-runs/wsr_123/archive/finalize":
+            return json_response(
+                {
+                    "archive": workspace_archive_body(),
+                    "workspaceRun": workspace_run_body(status="archive_uploaded"),
+                }
+            )
+        if path == "/v1/workspace-runs/wsr_123/start":
+            return json_response({"workspaceRun": workspace_run_body(status="running")})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = CrowNest(
+        api_key="cnk_test",
+        base_url="https://api.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    run = client.workspace_runs.run_archive(
+        b"repo",
+        command="pnpm test",
+        sha256="a" * 64,
+        size_bytes=4,
+        template="python-node",
+    )
+
+    assert run["status"] == "running"
+    assert [request.url.path for request in requests] == [
+        "/v1/workspace-runs",
+        "/v1/workspace-runs/wsr_123/archive-transfer",
+        "/wsr_123/upl_123",
+        "/v1/workspace-runs/wsr_123/archive/finalize",
+        "/v1/workspace-runs/wsr_123/start",
+    ]
+    assert json.loads(requests[0].content)["template"] == "python-node"
+    assert requests[2].content == b"repo"
+    assert requests[2].headers["content-length"] == "4"
+    assert requests[2].headers["x-upload-token"] == "token"
 
 
 @pytest.mark.asyncio
@@ -1367,8 +1948,13 @@ async def test_async_workspace_run_routes_and_stream() -> None:
     assert requests[4].url.query == b"stream=true"
 
 
-def json_response(body: object) -> httpx.Response:
-    return httpx.Response(200, json=body)
+def json_response(
+    body: object,
+    *,
+    headers: dict[str, str] | None = None,
+    status_code: int = 200,
+) -> httpx.Response:
+    return httpx.Response(status_code, headers=headers, json=body)
 
 
 def sandbox_body(**overrides: object) -> dict[str, object]:
@@ -1425,8 +2011,8 @@ def code_run_body() -> dict[str, object]:
         "language": "python",
         "outputs": [{"kind": "inline", "format": "text", "value": "hi"}],
         "sandboxId": "sbx_123",
-        "stderr": [],
-        "stdout": ["hi\n"],
+        "stderr": "",
+        "stdout": "hi\n",
     }
 
 

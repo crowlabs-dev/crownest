@@ -229,8 +229,8 @@ export type RunCodeResult = {
   readonly contextId: `cctx_${string}`;
   readonly language: CodeLanguage;
   readonly executionCount: number;
-  readonly stdout: readonly string[];
-  readonly stderr: readonly string[];
+  readonly stdout: string;
+  readonly stderr: string;
   readonly stdoutTruncated?: boolean;
   readonly stderrTruncated?: boolean;
   readonly outputs: readonly CodeOutput[];

@@ -39,6 +39,12 @@ describe("SDK preview creation", () => {
           preview: previewResponseBody({ authMode: "token" }),
           previewToken: "pvt_handle",
         }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ preview: previewResponseBody() }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          preview: previewResponseBody({ revokedAt: "2026-06-09T16:00:00.000Z" }),
+        }),
       );
     const client = createCrowNestClient({
       apiKey: "cn_live_test",
@@ -53,6 +59,12 @@ describe("SDK preview creation", () => {
     ).resolves.toMatchObject({
       preview: { authMode: "token", id: "prv_123" },
       previewToken: "pvt_handle",
+    });
+    await expect(sandbox.previews.get("prv_123")).resolves.toMatchObject({
+      id: "prv_123",
+    });
+    await expect(sandbox.previews.revoke("prv_123")).resolves.toMatchObject({
+      revokedAt: "2026-06-09T16:00:00.000Z",
     });
   });
 });
@@ -76,7 +88,10 @@ function sandboxResponse(): Response {
 }
 
 function previewResponseBody(
-  input: { readonly authMode?: "authenticated" | "token" } = {},
+  input: {
+    readonly authMode?: "authenticated" | "token";
+    readonly revokedAt?: string;
+  } = {},
 ) {
   return {
     authMode: input.authMode ?? "authenticated",
@@ -88,6 +103,7 @@ function previewResponseBody(
     sandboxId: "sbx_123",
     slug: "p-a1b2c3",
     url: "https://p-a1b2c3.crownest.dev",
+    ...(input.revokedAt === undefined ? {} : { revokedAt: input.revokedAt }),
   };
 }
 

@@ -1,5 +1,6 @@
 import type { CrowNestClient } from "@crownest/sdk";
 
+import { apiGet } from "./api-request";
 import {
   booleanFlag,
   jsonFlagSpec,
@@ -10,8 +11,15 @@ import {
   stringFlag,
   UsageError,
 } from "./flags";
-import type { CliResult } from "./index";
-import { jsonEnvelope, renderList, renderRecord } from "./output";
+import type { CliEnvironment, CliResult } from "./index";
+import { jsonEnvelope, jsonPageEnvelope, renderList, renderRecord } from "./output";
+import {
+  collectPages,
+  type Page,
+  paginationFlagSpec,
+  paginationOptions,
+  paginationSearchParams,
+} from "./pagination";
 
 export async function createPreviewCommand(
   client: () => CrowNestClient,
@@ -19,11 +27,14 @@ export async function createPreviewCommand(
 ): Promise<CliResult> {
   const parsed = parseFlags(args, {
     "--auth": "string",
+    "--auth-mode": "string",
     "--port": "string",
     ...jsonFlagSpec,
   });
   const port = requiredPort(stringFlag(parsed.flags, "--port"));
-  const authMode = previewAuthMode(stringFlag(parsed.flags, "--auth"));
+  const authMode = previewAuthMode(
+    stringFlag(parsed.flags, "--auth-mode") ?? stringFlag(parsed.flags, "--auth"),
+  );
   const sandboxId = requiredSandboxId(parsed.positionals[0], "sandbox id");
   rejectExtraPositionals(parsed.positionals.slice(1), "previews create");
   const response = await client().previews.create(sandboxId, {
@@ -43,17 +54,27 @@ export async function createPreviewCommand(
 }
 
 export async function listPreviewsCommand(
-  client: () => CrowNestClient,
+  _client: () => CrowNestClient,
   args: readonly string[],
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
 ): Promise<CliResult> {
-  const parsed = parseFlags(args, jsonFlagSpec);
+  const parsed = parseFlags(args, { ...paginationFlagSpec, ...jsonFlagSpec });
   const sandboxId = requiredSandboxId(parsed.positionals[0], "sandbox id");
   rejectExtraPositionals(parsed.positionals.slice(1), "previews list");
-  const previews = await client().previews.list(sandboxId);
+  const options = paginationOptions(parsed.flags);
+  const previewsPage = await collectPages(options, async (cursor) => {
+    const query = paginationSearchParams(options, cursor).toString();
+    return await apiGet<Page<Record<string, unknown>>>(
+      environment,
+      fetchImpl,
+      `/v1/sandboxes/${sandboxId}/previews${query.length === 0 ? "" : `?${query}`}`,
+    );
+  });
   return ok(
     booleanFlag(parsed.flags, "--json")
-      ? jsonEnvelope(previews)
-      : renderList(previews, [
+      ? jsonPageEnvelope(previewsPage)
+      : renderList(previewsPage.data, [
           { key: "id" },
           { key: "url" },
           { key: "port" },
@@ -104,7 +125,7 @@ function previewAuthMode(
     return value;
   }
 
-  throw new UsageError("--auth must be authenticated or token.");
+  throw new UsageError("--auth-mode must be authenticated or token.");
 }
 
 function ok(stdout: string): CliResult {

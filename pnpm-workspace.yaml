@@ -1,2 +1,5 @@
 packages:
   - "packages/*"
+
+catalog:
+  "esbuild": "0.28.1"

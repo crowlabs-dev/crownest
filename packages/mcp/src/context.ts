@@ -21,7 +21,7 @@ export function agentContextMarkdown(session: McpSession): string {
     "## Recommended Workflows",
     "",
     "- Repo-level task: create_workspace_run, upload_workspace_run_archive or staged archive transfer, finalize_workspace_run_archive, start_workspace_run, replay_workspace_run_events, get_workspace_run_evidence.",
-    "- Interactive shell task: create_sandbox or omit sandbox_id, start_command for long work, stream_command_logs for bounded logs, get_command for status.",
+    "- Interactive shell task: create_sandbox or omit sandbox_id, run_command with background=true for long work, stream_command_logs for bounded logs, get_command for status.",
     "- Stateful interpreter task: create_code_context when a separate interpreter context is needed, run_code for Python/JavaScript/TypeScript snippets, delete_code_context for cleanup.",
     "- Large output handoff: create_artifact or get_file_download_url, then get_artifact_download_url for durable artifact downloads.",
     "- Discovery and controls: list_projects, list_sandboxes, get_usage, list_api_keys, get_api_key.",
@@ -104,7 +104,7 @@ export function registerCrowNestContext(server: McpServer, session: McpSession):
             text: [
               "Use CrowNest Sandboxes for interactive cloud execution with /workspace as the workspace root.",
               "Omit sandbox_id to use the lazy MCP default Sandbox, or pass sandbox_id to adopt a visible Sandbox without making it exit-owned.",
-              "Use start_command plus stream_command_logs for long-running commands, run_code for stateful interpreter work, and Artifacts or download URLs for large outputs.",
+              "Use run_command with background=true plus stream_command_logs for long-running commands, run_code for stateful interpreter work, and Artifacts or download URLs for large outputs.",
             ].join("\n"),
             type: "text",
           },

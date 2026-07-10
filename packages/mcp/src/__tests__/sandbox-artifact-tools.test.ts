@@ -44,51 +44,63 @@ describe("Sandbox tools", () => {
     const inspected = createSandboxHandle("sbx_ready");
     const extended = createSandboxHandle("sbx_extended");
     const { client, tools } = createHarness();
-    client.mocks.listSandboxes.mockResolvedValueOnce(listed);
+    client.mocks.listSandboxes.mockResolvedValueOnce({
+      data: listed,
+      hasMore: true,
+      nextCursor: "sbx_cursor",
+    });
     client.mocks.getSandbox.mockResolvedValueOnce(inspected);
-    client.mocks.extendSandbox.mockResolvedValueOnce(extended);
+    client.mocks.setSandboxTtl.mockResolvedValueOnce(extended);
 
     const list = await callTool(tools, "list_sandboxes", {
+      cursor: "sandbox_input_cursor",
       limit: 1,
       status: "ready",
     });
     const get = await callTool(tools, "get_sandbox", {
       sandbox_id: "sbx_ready",
     });
-    const extend = await callTool(tools, "extend_sandbox", {
+    const setTtl = await callTool(tools, "set_sandbox_ttl", {
       sandbox_id: "sbx_ready",
       ttl_ms: 120_000,
     });
 
-    expect(client.mocks.listSandboxes).toHaveBeenCalledWith();
+    expect(client.mocks.listSandboxes).toHaveBeenCalledWith({
+      cursor: "sandbox_input_cursor",
+      limit: 1,
+    });
     expect(client.mocks.getSandbox).toHaveBeenCalledWith("sbx_ready");
-    expect(client.mocks.extendSandbox).toHaveBeenCalledWith("sbx_ready", {
+    expect(client.mocks.setSandboxTtl).toHaveBeenCalledWith("sbx_ready", {
       ttlMs: 120_000,
     });
     expect(text(list)).toContain('"sandbox_id": "sbx_ready"');
     expect(text(list)).not.toContain("sbx_destroyed");
+    expect(text(list)).toContain('"has_more": true');
+    expect(text(list)).toContain('"next_cursor": "sbx_cursor"');
     expect(text(get)).toContain('"template": "python-node@1.0.0"');
-    expect(text(extend)).toContain('"sandbox_id": "sbx_extended"');
+    expect(text(setTtl)).toContain('"sandbox_id": "sbx_extended"');
   });
+});
 
-  it("extends the lazy default Sandbox through the tracked handle", async () => {
+describe("Default Sandbox TTL", () => {
+  it("sets the lazy default Sandbox TTL through the tracked handle", async () => {
     const sandbox = createSandboxHandle("sbx_default");
     const extended = createSandboxHandle("sbx_default");
-    sandbox.mocks.sandboxExtend.mockResolvedValueOnce(extended);
+    sandbox.mocks.sandboxSetTtl.mockResolvedValueOnce(extended);
     const { client, tools } = createHarness([sandbox]);
 
-    const result = await callTool(tools, "extend_sandbox", {
+    const result = await callTool(tools, "set_sandbox_ttl", {
       ttl_ms: 120_000,
     });
 
-    expect(sandbox.mocks.sandboxExtend).toHaveBeenCalledWith({ ttlMs: 120_000 });
-    expect(client.mocks.extendSandbox).not.toHaveBeenCalled();
+    expect(sandbox.mocks.sandboxSetTtl).toHaveBeenCalledWith({ ttlMs: 120_000 });
+    expect(client.mocks.setSandboxTtl).not.toHaveBeenCalled();
     expect(text(result)).toContain('"sandbox_id": "sbx_default"');
   });
 });
 
-describe("Sandbox extension tracking", () => {
-  it("refreshes the tracked default Sandbox after explicit extension", async () => {
+describe("Sandbox TTL tracking", () => {
+  it("refreshes the tracked default Sandbox after an explicit TTL reset", async () => {
     const staleDefault = createSandboxHandle("sbx_default", {
       expiresAt: "1970-01-01T00:00:00.000Z",
     });
@@ -97,10 +109,10 @@ describe("Sandbox extension tracking", () => {
     staleDefault.mocks.codeRun.mockResolvedValueOnce(codeRunResult("sbx_default"));
     extendedDefault.mocks.codeRun.mockResolvedValueOnce(codeRunResult("sbx_default"));
     const { client, tools } = createHarness([staleDefault, fallback]);
-    client.mocks.extendSandbox.mockResolvedValueOnce(extendedDefault);
+    client.mocks.setSandboxTtl.mockResolvedValueOnce(extendedDefault);
 
     await callTool(tools, "run_code", { code: "print(1)" });
-    await callTool(tools, "extend_sandbox", {
+    await callTool(tools, "set_sandbox_ttl", {
       sandbox_id: "sbx_default",
       ttl_ms: 120_000,
     });
@@ -146,7 +158,11 @@ describe("Artifact tools", () => {
   it("creates, lists, inspects, and deletes Artifact metadata", async () => {
     const sandbox = createSandboxHandle("sbx_artifacts");
     sandbox.mocks.artifactCreate.mockResolvedValueOnce(artifact());
-    sandbox.mocks.artifactList.mockResolvedValueOnce([artifact()]);
+    sandbox.mocks.artifactList.mockResolvedValueOnce({
+      data: [artifact()],
+      hasMore: true,
+      nextCursor: "artifact_cursor",
+    });
     const { client, tools } = createHarness([sandbox]);
     client.mocks.getArtifact.mockResolvedValueOnce(artifact());
     client.mocks.deleteArtifact.mockResolvedValueOnce({
@@ -158,7 +174,10 @@ describe("Artifact tools", () => {
       name: "plot.png",
       source_path: "/workspace/plot.png",
     });
-    const list = await callTool(tools, "list_artifacts", {});
+    const list = await callTool(tools, "list_artifacts", {
+      cursor: "artifact_input_cursor",
+      limit: 50,
+    });
     const get = await callTool(tools, "get_artifact", {
       artifact_id: "art_123",
     });
@@ -170,11 +189,16 @@ describe("Artifact tools", () => {
       name: "plot.png",
       path: "/workspace/plot.png",
     });
-    expect(sandbox.mocks.artifactList).toHaveBeenCalledWith();
+    expect(sandbox.mocks.artifactList).toHaveBeenCalledWith({
+      cursor: "artifact_input_cursor",
+      limit: 50,
+    });
     expect(client.mocks.getArtifact).toHaveBeenCalledWith("art_123");
     expect(client.mocks.deleteArtifact).toHaveBeenCalledWith("art_123");
     expect(text(created)).toContain('"artifact_id": "art_123"');
     expect(text(list)).toContain('"sandbox_id": "sbx_artifacts"');
+    expect(text(list)).toContain('"has_more": true');
+    expect(text(list)).toContain('"next_cursor": "artifact_cursor"');
     expect(text(get)).not.toContain("content_base64");
     expect(text(deleted)).toContain('"artifact_id": "art_123"');
     expect(text(deleted)).toContain('"deleted_at": "2026-06-12T12:01:00.000Z"');
@@ -291,8 +315,8 @@ function codeRunResult(sandboxId: `sbx_${string}`) {
     language: "python",
     outputs: [],
     sandboxId,
-    stderr: [],
-    stdout: ["1"],
+    stderr: "",
+    stdout: "1",
   };
 }
 

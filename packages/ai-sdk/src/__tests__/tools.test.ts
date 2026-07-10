@@ -132,8 +132,8 @@ function registerCodeResultTests(): void {
       language: "python",
       outputs: [],
       sandboxId: "sbx_lazy",
-      stderr: [],
-      stdout: [],
+      stderr: "",
+      stdout: "",
     });
     const tools = crownestTools({ client });
 
@@ -286,8 +286,8 @@ function mockCodeRun() {
         language: "python",
         outputs: [],
         sandboxId,
-        stderr: [],
-        stdout: [`ran ${input.code}`],
+        stderr: "",
+        stdout: `ran ${input.code}`,
       }),
   );
 }
@@ -360,6 +360,6 @@ type CodeRunFixture = {
   readonly language: "python";
   readonly outputs: readonly [];
   readonly sandboxId: `sbx_${string}`;
-  readonly stderr: readonly string[];
-  readonly stdout: readonly string[];
+  readonly stderr: string;
+  readonly stdout: string;
 };

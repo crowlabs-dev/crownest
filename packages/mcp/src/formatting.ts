@@ -1,5 +1,22 @@
 import type { CallToolResult, TextContent } from "@modelcontextprotocol/sdk/types.js";
 
+import type {
+  ApiKeyMetadata,
+  ArtifactMetadata,
+  CodeContextMetadata,
+  PreviewMetadata,
+  ProjectMetadata,
+  SandboxMetadata,
+} from "./resource-formatting";
+import {
+  apiKeyPayload,
+  artifactPayload,
+  codeContextPayload,
+  previewPayload,
+  projectPayload,
+  sandboxPayload,
+} from "./resource-formatting";
+
 const CODE_ERROR_MAX_LENGTH = 2_000;
 
 type CodeOutput =
@@ -24,14 +41,20 @@ type CodeRunResult = {
   readonly executionCount?: number;
   readonly outputs?: readonly CodeOutput[];
   readonly sandboxId: string;
-  readonly stderr?: readonly string[];
-  readonly stdout?: readonly string[];
+  readonly stderr?: string;
+  readonly stdout?: string;
+};
+
+type PaginationMetadata = {
+  readonly hasMore: boolean;
+  readonly nextCursor?: string;
 };
 
 type CommandResult = {
   readonly commandId: string;
   readonly exitCode?: number;
   readonly sandboxId: string;
+  readonly status: string;
   readonly stderr?: string;
   readonly stdout?: string;
 };
@@ -56,17 +79,6 @@ type CommandLogChunk = {
   readonly stream: string;
 };
 
-type ArtifactMetadata = {
-  readonly createdAt?: string;
-  readonly contentType?: string;
-  readonly deletedAt?: string;
-  readonly id: string;
-  readonly name?: string;
-  readonly sandboxId?: string;
-  readonly sizeBytes?: number;
-  readonly sourcePath?: string;
-};
-
 type FileEntry = {
   readonly path: string;
   readonly sizeBytes?: number;
@@ -78,59 +90,6 @@ type FileStat = {
   readonly path: string;
   readonly sizeBytes: number;
   readonly type: string;
-};
-
-type SandboxMetadata = {
-  readonly createdAt?: string;
-  readonly destroyedAt?: string;
-  readonly expiresAt: string;
-  readonly id: string;
-  readonly projectId?: string;
-  readonly status: string;
-  readonly templateSlug?: string;
-  readonly templateVersion?: string;
-  readonly ttlMs?: number;
-};
-
-type PreviewMetadata = {
-  readonly authMode: string;
-  readonly createdAt?: string;
-  readonly expiresAt?: string;
-  readonly id: string;
-  readonly port: number;
-  readonly revokedAt?: string;
-  readonly sandboxId: string;
-  readonly slug: string;
-  readonly url: string;
-};
-
-type CodeContextMetadata = {
-  readonly createdAt?: string;
-  readonly cwd: string;
-  readonly expiresAt?: string;
-  readonly id: string;
-  readonly isDefault?: boolean;
-  readonly language: string;
-  readonly sandboxId: string;
-};
-
-type ApiKeyMetadata = {
-  readonly createdAt?: string;
-  readonly id: string;
-  readonly last4: string;
-  readonly lastUsedAt?: string;
-  readonly name: string;
-  readonly prefix: string;
-  readonly projectIds?: readonly string[];
-  readonly revokedAt?: string;
-  readonly scopes: readonly string[];
-};
-
-type ProjectMetadata = {
-  readonly createdAt?: string;
-  readonly id: string;
-  readonly name: string;
-  readonly orgId?: string;
 };
 
 export function textResult(text: string): CallToolResult {
@@ -157,8 +116,8 @@ export function formatCodeRun(result: CodeRunResult): CallToolResult {
       ? []
       : [`execution_count: ${result.executionCount}`]),
     ...(result.durationMs === undefined ? [] : [`duration_ms: ${result.durationMs}`]),
-    `stdout:\n${joinLines(result.stdout)}`,
-    `stderr:\n${joinLines(result.stderr)}`,
+    `stdout:\n${result.stdout ?? ""}`,
+    `stderr:\n${result.stderr ?? ""}`,
     ...formatCodeOutputs(result.outputs ?? []),
   ];
 
@@ -170,6 +129,7 @@ export function formatCommand(command: CommandResult): CallToolResult {
     [
       `command_id: ${command.commandId}`,
       `sandbox_id: ${command.sandboxId}`,
+      `status: ${command.status}`,
       `exit_code: ${command.exitCode ?? ""}`,
       `stdout:\n${command.stdout ?? ""}`,
       `stderr:\n${command.stderr ?? ""}`,
@@ -254,9 +214,12 @@ export function formatArtifact(artifact: ArtifactMetadata): CallToolResult {
 export function formatArtifactList(
   sandboxId: string,
   artifacts: readonly ArtifactMetadata[],
+  pagination: PaginationMetadata,
 ): CallToolResult {
   return jsonTextResult({
     data: artifacts.map(artifactPayload),
+    has_more: pagination.hasMore,
+    next_cursor: pagination.nextCursor ?? null,
     sandbox_id: sandboxId,
   });
 }
@@ -267,8 +230,13 @@ export function formatSandbox(sandbox: SandboxMetadata): CallToolResult {
 
 export function formatSandboxList(
   sandboxes: readonly SandboxMetadata[],
+  pagination: PaginationMetadata,
 ): CallToolResult {
-  return jsonTextResult({ data: sandboxes.map(sandboxPayload) });
+  return jsonTextResult({
+    data: sandboxes.map(sandboxPayload),
+    has_more: pagination.hasMore,
+    next_cursor: pagination.nextCursor ?? null,
+  });
 }
 
 export function formatPreview(preview: PreviewMetadata): CallToolResult {
@@ -288,9 +256,12 @@ export function formatPreviewCreate(
 export function formatPreviewList(
   sandboxId: string,
   previews: readonly PreviewMetadata[],
+  pagination: PaginationMetadata,
 ): CallToolResult {
   return jsonTextResult({
     data: previews.map(previewPayload),
+    has_more: pagination.hasMore,
+    next_cursor: pagination.nextCursor ?? null,
     sandbox_id: sandboxId,
   });
 }
@@ -302,9 +273,12 @@ export function formatCodeContext(context: CodeContextMetadata): CallToolResult 
 export function formatCodeContextList(
   sandboxId: string,
   contexts: readonly CodeContextMetadata[],
+  pagination: PaginationMetadata,
 ): CallToolResult {
   return jsonTextResult({
     data: contexts.map(codeContextPayload),
+    has_more: pagination.hasMore,
+    next_cursor: pagination.nextCursor ?? null,
     sandbox_id: sandboxId,
   });
 }
@@ -313,8 +287,15 @@ export function formatApiKey(apiKey: ApiKeyMetadata): CallToolResult {
   return jsonTextResult(apiKeyPayload(apiKey));
 }
 
-export function formatApiKeyList(apiKeys: readonly ApiKeyMetadata[]): CallToolResult {
-  return jsonTextResult({ data: apiKeys.map(apiKeyPayload) });
+export function formatApiKeyList(
+  apiKeys: readonly ApiKeyMetadata[],
+  pagination: PaginationMetadata,
+): CallToolResult {
+  return jsonTextResult({
+    data: apiKeys.map(apiKeyPayload),
+    has_more: pagination.hasMore,
+    next_cursor: pagination.nextCursor ?? null,
+  });
 }
 
 export function formatProject(project: ProjectMetadata): CallToolResult {
@@ -323,25 +304,17 @@ export function formatProject(project: ProjectMetadata): CallToolResult {
 
 export function formatProjectList(
   projects: readonly ProjectMetadata[],
+  pagination: PaginationMetadata,
 ): CallToolResult {
-  return jsonTextResult({ data: projects.map(projectPayload) });
-}
-
-function projectPayload(project: ProjectMetadata): Record<string, unknown> {
-  return {
-    created_at: project.createdAt,
-    name: project.name,
-    org_id: project.orgId,
-    project_id: project.id,
-  };
+  return jsonTextResult({
+    data: projects.map(projectPayload),
+    has_more: pagination.hasMore,
+    next_cursor: pagination.nextCursor ?? null,
+  });
 }
 
 function textContent(text: string): TextContent {
   return { text, type: "text" };
-}
-
-function joinLines(lines: readonly string[] | undefined): string {
-  return lines?.join("\n") ?? "";
 }
 
 function formatCodeOutputs(outputs: readonly CodeOutput[]): readonly string[] {
@@ -375,79 +348,6 @@ function truncate(value: string): string {
   }
 
   return `${value.slice(0, CODE_ERROR_MAX_LENGTH)}...`;
-}
-
-function artifactPayload(artifact: ArtifactMetadata): Record<string, unknown> {
-  return {
-    artifact_id: artifact.id,
-    content_type: artifact.contentType,
-    created_at: artifact.createdAt,
-    deleted_at: artifact.deletedAt,
-    name: artifact.name,
-    sandbox_id: artifact.sandboxId,
-    size_bytes: artifact.sizeBytes,
-    source_path: artifact.sourcePath,
-  };
-}
-
-function sandboxPayload(sandbox: SandboxMetadata): Record<string, unknown> {
-  return {
-    created_at: sandbox.createdAt,
-    destroyed_at: sandbox.destroyedAt,
-    expires_at: sandbox.expiresAt,
-    project_id: sandbox.projectId,
-    sandbox_id: sandbox.id,
-    status: sandbox.status,
-    template: formatTemplate(sandbox),
-    ttl_ms: sandbox.ttlMs,
-  };
-}
-
-function previewPayload(preview: PreviewMetadata): Record<string, unknown> {
-  return {
-    auth_mode: preview.authMode,
-    created_at: preview.createdAt,
-    expires_at: preview.expiresAt,
-    port: preview.port,
-    preview_id: preview.id,
-    revoked_at: preview.revokedAt,
-    sandbox_id: preview.sandboxId,
-    slug: preview.slug,
-    url: preview.url,
-  };
-}
-
-function codeContextPayload(context: CodeContextMetadata): Record<string, unknown> {
-  return {
-    code_context_id: context.id,
-    created_at: context.createdAt,
-    cwd: context.cwd,
-    expires_at: context.expiresAt,
-    is_default: context.isDefault,
-    language: context.language,
-    sandbox_id: context.sandboxId,
-  };
-}
-
-function apiKeyPayload(apiKey: ApiKeyMetadata): Record<string, unknown> {
-  return {
-    api_key_id: apiKey.id,
-    created_at: apiKey.createdAt,
-    last4: apiKey.last4,
-    last_used_at: apiKey.lastUsedAt,
-    name: apiKey.name,
-    prefix: apiKey.prefix,
-    project_ids: apiKey.projectIds,
-    revoked_at: apiKey.revokedAt,
-    scopes: apiKey.scopes,
-  };
-}
-
-function formatTemplate(sandbox: SandboxMetadata): string | undefined {
-  if (sandbox.templateSlug === undefined) return undefined;
-  return sandbox.templateVersion === undefined
-    ? sandbox.templateSlug
-    : `${sandbox.templateSlug}@${sandbox.templateVersion}`;
 }
 
 function splitLogLines(data: string): readonly string[] {

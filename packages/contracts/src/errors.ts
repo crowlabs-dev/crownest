@@ -38,6 +38,7 @@ export const ErrorCode = {
   PathOutsideWorkspace: "path_outside_workspace",
   PreviewUnavailable: "preview_unavailable",
   QuotaExceeded: "quota_exceeded",
+  ResourceAllocationFailed: "resource_allocation_failed",
   OrgSuspended: "org_suspended",
   RateLimited: "rate_limited",
   ReservedEnvKey: "reserved_env_key",
@@ -65,4 +66,6 @@ export type ApiError = {
   readonly code: ErrorCode;
   readonly message: string;
   readonly details?: Record<string, unknown>;
+  readonly requestId?: string;
+  readonly retryable?: boolean;
 };

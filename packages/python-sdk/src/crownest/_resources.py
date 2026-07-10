@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, TypeVar
 from urllib.parse import urlencode
 
 import httpx
 
 from crownest._errors import CrowNestApiError
+from crownest._pagination import AsyncPage, Page
 from crownest._transport import (
     DEFAULT_TIMEOUT_SECONDS,
     AsyncTransport,
@@ -41,13 +43,16 @@ class CrowNest:
         *,
         api_key: str | None = None,
         base_url: str = "https://api.crownest.dev",
+        credential: str | None = None,
         http_client: httpx.Client | None = None,
+        max_retries: int = 2,
         timeout: TimeoutConfig = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._transport = SyncTransport(
-            api_key=api_key,
+            api_key=credential if credential is not None else api_key,
             base_url=base_url,
             http_client=http_client,
+            max_retries=max_retries,
             timeout=timeout,
         )
         self.api_keys = ApiKeysClient(self._transport)
@@ -83,13 +88,16 @@ class AsyncCrowNest:
         *,
         api_key: str | None = None,
         base_url: str = "https://api.crownest.dev",
+        credential: str | None = None,
         http_client: httpx.AsyncClient | None = None,
+        max_retries: int = 2,
         timeout: TimeoutConfig = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._transport = AsyncTransport(
-            api_key=api_key,
+            api_key=credential if credential is not None else api_key,
             base_url=base_url,
             http_client=http_client,
+            max_retries=max_retries,
             timeout=timeout,
         )
         self.api_keys = AsyncApiKeysClient(self._transport)
@@ -141,21 +149,54 @@ class SandboxHandle(Mapping[str, Json]):
         )
         return SandboxHandle(response["sandbox"], self._transport)
 
-    def extend(
+    def set_ttl(
         self,
         *,
         ttl_ms: int,
         idempotency_key: str | None = None,
     ) -> "SandboxHandle":
-        """Reset this live Sandbox TTL from now and return updated metadata."""
+        """Set this Sandbox TTL, resetting its countdown from now."""
         response = self._transport.request(
-            f"/v1/sandboxes/{self.id}/extend",
+            f"/v1/sandboxes/{self.id}/ttl",
             method="POST",
             body={"ttlMs": ttl_ms},
             idempotency_key=idempotency_key,
             idempotent=True,
         )
         return SandboxHandle(response["sandbox"], self._transport)
+
+    def wait_until_ready(
+        self,
+        *,
+        initial_interval_seconds: float = 0.25,
+        interval_seconds: float | None = None,
+        max_interval_seconds: float = 4.0,
+        timeout_seconds: float = 60.0,
+    ) -> "SandboxHandle":
+        """Poll with backoff until this Sandbox is ready to accept work."""
+        return _wait_for_value(
+            lambda: SandboxHandle(
+                self._transport.request(f"/v1/sandboxes/{self.id}", method="GET")[
+                    "sandbox"
+                ],
+                self._transport,
+            ),
+            lambda sandbox: (
+                str(sandbox.get("status", "")) in {"ready", "running", "idle"}
+            ),
+            description=f"Sandbox {self.id} to become ready",
+            initial=self,
+            initial_interval_seconds=(
+                initial_interval_seconds
+                if interval_seconds is None
+                else interval_seconds
+            ),
+            max_interval_seconds=max_interval_seconds,
+            terminal=lambda sandbox: (
+                str(sandbox.get("status", "")) in {"destroyed", "failed"}
+            ),
+            timeout_seconds=timeout_seconds,
+        )
 
     def to_dict(self) -> JsonObject:
         """Return this SandboxHandle's raw Sandbox metadata as a dict."""
@@ -201,21 +242,56 @@ class AsyncSandboxHandle(Mapping[str, Json]):
         )
         return AsyncSandboxHandle(response["sandbox"], self._transport)
 
-    async def extend(
+    async def set_ttl(
         self,
         *,
         ttl_ms: int,
         idempotency_key: str | None = None,
     ) -> "AsyncSandboxHandle":
-        """Reset this live Sandbox TTL from now and return updated metadata."""
+        """Set this Sandbox TTL, resetting its countdown from now."""
         response = await self._transport.request(
-            f"/v1/sandboxes/{self.id}/extend",
+            f"/v1/sandboxes/{self.id}/ttl",
             method="POST",
             body={"ttlMs": ttl_ms},
             idempotency_key=idempotency_key,
             idempotent=True,
         )
         return AsyncSandboxHandle(response["sandbox"], self._transport)
+
+    async def wait_until_ready(
+        self,
+        *,
+        initial_interval_seconds: float = 0.25,
+        interval_seconds: float | None = None,
+        max_interval_seconds: float = 4.0,
+        timeout_seconds: float = 60.0,
+    ) -> "AsyncSandboxHandle":
+        """Poll with backoff until this Sandbox is ready to accept work."""
+
+        async def fetch() -> AsyncSandboxHandle:
+            response = await self._transport.request(
+                f"/v1/sandboxes/{self.id}", method="GET"
+            )
+            return AsyncSandboxHandle(response["sandbox"], self._transport)
+
+        return await _async_wait_for_value(
+            fetch,
+            lambda sandbox: (
+                str(sandbox.get("status", "")) in {"ready", "running", "idle"}
+            ),
+            description=f"Sandbox {self.id} to become ready",
+            initial=self,
+            initial_interval_seconds=(
+                initial_interval_seconds
+                if interval_seconds is None
+                else interval_seconds
+            ),
+            max_interval_seconds=max_interval_seconds,
+            terminal=lambda sandbox: (
+                str(sandbox.get("status", "")) in {"destroyed", "failed"}
+            ),
+            timeout_seconds=timeout_seconds,
+        )
 
     def to_dict(self) -> JsonObject:
         """Return this SandboxHandle's raw Sandbox metadata as a dict."""
@@ -268,9 +344,17 @@ class CodeClient:
         """Return Code Context metadata for a Sandbox."""
         return _get_code_context(self._transport, sandbox_id, context_id)
 
-    def list_contexts(self, sandbox_id: str) -> list[JsonObject]:
-        """List Code Context metadata records for a Sandbox."""
-        return _list_code_contexts(self._transport, sandbox_id)
+    def list_contexts(
+        self,
+        sandbox_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Page[JsonObject]:
+        """Return an auto-paginating Code Context page for a Sandbox."""
+        return _list_code_contexts(
+            self._transport, sandbox_id, cursor=cursor, limit=limit
+        )
 
     def run(
         self,
@@ -354,9 +438,17 @@ class AsyncCodeClient:
         """Return Code Context metadata for a Sandbox."""
         return await _async_get_code_context(self._transport, sandbox_id, context_id)
 
-    async def list_contexts(self, sandbox_id: str) -> list[JsonObject]:
-        """List Code Context metadata records for a Sandbox."""
-        return await _async_list_code_contexts(self._transport, sandbox_id)
+    async def list_contexts(
+        self,
+        sandbox_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> AsyncPage[JsonObject]:
+        """Return an async auto-paginating Code Context page."""
+        return await _async_list_code_contexts(
+            self._transport, sandbox_id, cursor=cursor, limit=limit
+        )
 
     async def run(
         self,
@@ -447,16 +539,16 @@ class SandboxesClient:
         response = self._transport.request(f"/v1/sandboxes/{sandbox_id}", method="GET")
         return SandboxHandle(response["sandbox"], self._transport)
 
-    def extend(
+    def set_ttl(
         self,
         sandbox_id: str,
         *,
         ttl_ms: int,
         idempotency_key: str | None = None,
     ) -> SandboxHandle:
-        """Reset a live Sandbox TTL from now and return a SandboxHandle."""
+        """Set a Sandbox TTL, resetting its countdown from now."""
         response = self._transport.request(
-            f"/v1/sandboxes/{sandbox_id}/extend",
+            f"/v1/sandboxes/{sandbox_id}/ttl",
             method="POST",
             body={"ttlMs": ttl_ms},
             idempotency_key=idempotency_key,
@@ -464,21 +556,33 @@ class SandboxesClient:
         )
         return SandboxHandle(response["sandbox"], self._transport)
 
-    def kill(self, sandbox_id: str) -> JsonObject:
-        """Kill a live Sandbox and return destroyed Sandbox metadata."""
+    def kill(self, sandbox_id: str) -> SandboxHandle:
+        """Kill a live Sandbox and return a SandboxHandle for destroyed metadata."""
         response = self._transport.request(
             f"/v1/sandboxes/{sandbox_id}",
             method="DELETE",
         )
-        return response["sandbox"]
+        return SandboxHandle(response["sandbox"], self._transport)
 
-    def list(self, *, metadata: Metadata | None = None) -> list[JsonObject]:
-        """List live Sandboxes visible to the configured credential."""
+    def list(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        metadata: Metadata | None = None,
+    ) -> Page[SandboxHandle]:
+        """Return a page that iterates through all visible live Sandboxes."""
         response = self._transport.request(
-            f"/v1/sandboxes{_sandbox_list_query(metadata)}",
+            f"/v1/sandboxes{_sandbox_list_query(metadata, limit, cursor)}",
             method="GET",
         )
-        return list(response["data"])
+        return Page(
+            response,
+            lambda next_cursor: self.list(
+                cursor=next_cursor, limit=limit, metadata=metadata
+            ),
+            transform=lambda item: SandboxHandle(item, self._transport),  # type: ignore[arg-type]
+        )
 
 
 class AsyncSandboxesClient:
@@ -521,16 +625,16 @@ class AsyncSandboxesClient:
         )
         return AsyncSandboxHandle(response["sandbox"], self._transport)
 
-    async def extend(
+    async def set_ttl(
         self,
         sandbox_id: str,
         *,
         ttl_ms: int,
         idempotency_key: str | None = None,
     ) -> AsyncSandboxHandle:
-        """Reset a live Sandbox TTL from now and return a SandboxHandle."""
+        """Set a Sandbox TTL, resetting its countdown from now."""
         response = await self._transport.request(
-            f"/v1/sandboxes/{sandbox_id}/extend",
+            f"/v1/sandboxes/{sandbox_id}/ttl",
             method="POST",
             body={"ttlMs": ttl_ms},
             idempotency_key=idempotency_key,
@@ -538,21 +642,33 @@ class AsyncSandboxesClient:
         )
         return AsyncSandboxHandle(response["sandbox"], self._transport)
 
-    async def kill(self, sandbox_id: str) -> JsonObject:
-        """Kill a live Sandbox and return destroyed Sandbox metadata."""
+    async def kill(self, sandbox_id: str) -> AsyncSandboxHandle:
+        """Kill a live Sandbox and return a SandboxHandle for destroyed metadata."""
         response = await self._transport.request(
             f"/v1/sandboxes/{sandbox_id}",
             method="DELETE",
         )
-        return response["sandbox"]
+        return AsyncSandboxHandle(response["sandbox"], self._transport)
 
-    async def list(self, *, metadata: Metadata | None = None) -> list[JsonObject]:
-        """List live Sandboxes visible to the configured credential."""
+    async def list(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        metadata: Metadata | None = None,
+    ) -> AsyncPage[AsyncSandboxHandle]:
+        """Return a page that asynchronously iterates through live Sandboxes."""
         response = await self._transport.request(
-            f"/v1/sandboxes{_sandbox_list_query(metadata)}",
+            f"/v1/sandboxes{_sandbox_list_query(metadata, limit, cursor)}",
             method="GET",
         )
-        return list(response["data"])
+        return AsyncPage(
+            response,
+            lambda next_cursor: self.list(
+                cursor=next_cursor, limit=limit, metadata=metadata
+            ),
+            transform=lambda item: AsyncSandboxHandle(item, self._transport),  # type: ignore[arg-type]
+        )
 
 
 class WorkspaceRunsClient:
@@ -667,6 +783,111 @@ class WorkspaceRunsClient:
             idempotent=True,
         )
 
+    def run_archive(
+        self,
+        content: bytes,
+        *,
+        command: str,
+        sha256: str,
+        size_bytes: int,
+        artifacts: Sequence[WorkspaceRunArtifactRequest] | None = None,
+        idempotency_key: str | None = None,
+        keep_sandbox: bool | None = None,
+        metadata: Metadata | None = None,
+        project_id: str | None = None,
+        sandbox_id: str | None = None,
+        source_metadata: Metadata | None = None,
+        template: str | None = None,
+        template_version_id: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> JsonObject:
+        """Create, upload, finalize, and start a Workspace Run archive."""
+        run = self.create(
+            artifacts=artifacts,
+            command=command,
+            idempotency_key=idempotency_key,
+            keep_sandbox=keep_sandbox,
+            metadata=metadata,
+            project_id=project_id,
+            sandbox_id=sandbox_id,
+            source_metadata=source_metadata,
+            template=template,
+            template_version_id=template_version_id,
+            timeout_ms=timeout_ms,
+        )
+        transfer = self.create_archive_transfer(
+            str(run["id"]),
+            sha256=sha256,
+            size_bytes=size_bytes,
+        )
+        self.upload_archive_to_transfer(
+            transfer,
+            content,
+            headers={"content-length": str(size_bytes)},
+        )
+        self.finalize_archive(
+            str(run["id"]),
+            sha256=sha256,
+            size_bytes=size_bytes,
+            upload_id=str(transfer["id"]),
+        )
+        return self.start(str(run["id"]))
+
+    def run(
+        self,
+        content: bytes,
+        *,
+        command: str,
+        artifacts: Sequence[WorkspaceRunArtifactRequest] | None = None,
+        idempotency_key: str | None = None,
+        keep_sandbox: bool | None = None,
+        metadata: Metadata | None = None,
+        project_id: str | None = None,
+        sandbox_id: str | None = None,
+        source_metadata: Metadata | None = None,
+        stream: bool = False,
+        template: str | None = None,
+        template_version_id: str | None = None,
+        timeout_ms: int | None = None,
+        wait_timeout_seconds: float = 600.0,
+    ) -> JsonObject | Iterator[JsonObject]:
+        """Create, upload, start, and then stream or wait for a Workspace Run."""
+        sha256 = hashlib.sha256(content).hexdigest()
+        size_bytes = len(content)
+        run = self.create(
+            artifacts=artifacts,
+            command=command,
+            idempotency_key=idempotency_key,
+            keep_sandbox=keep_sandbox,
+            metadata=metadata,
+            project_id=project_id,
+            sandbox_id=sandbox_id,
+            source_metadata=source_metadata,
+            template=template,
+            template_version_id=template_version_id,
+            timeout_ms=timeout_ms,
+        )
+        run_id = str(run["id"])
+        if size_bytes <= _MAX_DIRECT_ARCHIVE_BYTES:
+            self.upload_archive(run_id, content, sha256=sha256, size_bytes=size_bytes)
+        else:
+            transfer = self.create_archive_transfer(
+                run_id, sha256=sha256, size_bytes=size_bytes
+            )
+            self.upload_archive_to_transfer(
+                transfer, content, headers={"content-length": str(size_bytes)}
+            )
+            self.finalize_archive(
+                run_id,
+                sha256=sha256,
+                size_bytes=size_bytes,
+                upload_id=str(transfer["id"]),
+            )
+        self.start(run_id)
+        if stream:
+            return self.stream_events(run_id)
+        return self.wait_for_terminal(run_id, timeout_seconds=wait_timeout_seconds)
+
     def start(
         self,
         workspace_run_id: str,
@@ -693,16 +914,27 @@ class WorkspaceRunsClient:
     def list(
         self,
         *,
+        cursor: str | None = None,
+        limit: int | None = None,
         metadata: Metadata | None = None,
         project_id: str | None = None,
         status: WorkspaceRunStatus | None = None,
-    ) -> list[JsonObject]:
-        """List Workspace Runs visible to the configured credential."""
+    ) -> Page[JsonObject]:
+        """Return a page that iterates through all matching Workspace Runs."""
         response = self._transport.request(
-            f"/v1/workspace-runs{_workspace_run_list_query(metadata, project_id, status)}",
+            f"/v1/workspace-runs{_workspace_run_list_query(metadata, project_id, status, limit, cursor)}",
             method="GET",
         )
-        return list(response["data"])
+        return Page(
+            response,
+            lambda next_cursor: self.list(
+                cursor=next_cursor,
+                limit=limit,
+                metadata=metadata,
+                project_id=project_id,
+                status=status,
+            ),
+        )
 
     def list_events(
         self,
@@ -731,6 +963,38 @@ class WorkspaceRunsClient:
             workspace_run_id,
             after_seq=after_seq,
             reconnect=reconnect,
+        )
+
+    def wait_until_done(
+        self,
+        workspace_run_id: str,
+        *,
+        interval_seconds: float = 1.0,
+        timeout_seconds: float = 600.0,
+    ) -> JsonObject:
+        """Poll until a Workspace Run reaches a terminal status."""
+        return self.wait_for_terminal(
+            workspace_run_id,
+            initial_interval_seconds=interval_seconds,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def wait_for_terminal(
+        self,
+        workspace_run_id: str,
+        *,
+        initial_interval_seconds: float = 0.25,
+        max_interval_seconds: float = 4.0,
+        timeout_seconds: float = 600.0,
+    ) -> JsonObject:
+        """Poll with backoff until a Workspace Run reaches a terminal state."""
+        return _wait_for_value(
+            lambda: self.get(workspace_run_id),
+            lambda run: str(run.get("status")) in {"succeeded", "failed", "canceled"},
+            description=f"Workspace Run {workspace_run_id} to finish",
+            initial_interval_seconds=initial_interval_seconds,
+            max_interval_seconds=max_interval_seconds,
+            timeout_seconds=timeout_seconds,
         )
 
     def cancel(
@@ -869,6 +1133,115 @@ class AsyncWorkspaceRunsClient:
             idempotent=True,
         )
 
+    async def run_archive(
+        self,
+        content: bytes,
+        *,
+        command: str,
+        sha256: str,
+        size_bytes: int,
+        artifacts: Sequence[WorkspaceRunArtifactRequest] | None = None,
+        idempotency_key: str | None = None,
+        keep_sandbox: bool | None = None,
+        metadata: Metadata | None = None,
+        project_id: str | None = None,
+        sandbox_id: str | None = None,
+        source_metadata: Metadata | None = None,
+        template: str | None = None,
+        template_version_id: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> JsonObject:
+        """Create, upload, finalize, and start a Workspace Run archive."""
+        run = await self.create(
+            artifacts=artifacts,
+            command=command,
+            idempotency_key=idempotency_key,
+            keep_sandbox=keep_sandbox,
+            metadata=metadata,
+            project_id=project_id,
+            sandbox_id=sandbox_id,
+            source_metadata=source_metadata,
+            template=template,
+            template_version_id=template_version_id,
+            timeout_ms=timeout_ms,
+        )
+        transfer = await self.create_archive_transfer(
+            str(run["id"]),
+            sha256=sha256,
+            size_bytes=size_bytes,
+        )
+        await self.upload_archive_to_transfer(
+            transfer,
+            content,
+            headers={"content-length": str(size_bytes)},
+        )
+        await self.finalize_archive(
+            str(run["id"]),
+            sha256=sha256,
+            size_bytes=size_bytes,
+            upload_id=str(transfer["id"]),
+        )
+        return await self.start(str(run["id"]))
+
+    async def run(
+        self,
+        content: bytes,
+        *,
+        command: str,
+        artifacts: Sequence[WorkspaceRunArtifactRequest] | None = None,
+        idempotency_key: str | None = None,
+        keep_sandbox: bool | None = None,
+        metadata: Metadata | None = None,
+        project_id: str | None = None,
+        sandbox_id: str | None = None,
+        source_metadata: Metadata | None = None,
+        stream: bool = False,
+        template: str | None = None,
+        template_version_id: str | None = None,
+        timeout_ms: int | None = None,
+        wait_timeout_seconds: float = 600.0,
+    ) -> JsonObject | AsyncIterator[JsonObject]:
+        """Create, upload, start, and then stream or wait for a Workspace Run."""
+        sha256 = hashlib.sha256(content).hexdigest()
+        size_bytes = len(content)
+        run = await self.create(
+            artifacts=artifacts,
+            command=command,
+            idempotency_key=idempotency_key,
+            keep_sandbox=keep_sandbox,
+            metadata=metadata,
+            project_id=project_id,
+            sandbox_id=sandbox_id,
+            source_metadata=source_metadata,
+            template=template,
+            template_version_id=template_version_id,
+            timeout_ms=timeout_ms,
+        )
+        run_id = str(run["id"])
+        if size_bytes <= _MAX_DIRECT_ARCHIVE_BYTES:
+            await self.upload_archive(
+                run_id, content, sha256=sha256, size_bytes=size_bytes
+            )
+        else:
+            transfer = await self.create_archive_transfer(
+                run_id, sha256=sha256, size_bytes=size_bytes
+            )
+            await self.upload_archive_to_transfer(
+                transfer, content, headers={"content-length": str(size_bytes)}
+            )
+            await self.finalize_archive(
+                run_id,
+                sha256=sha256,
+                size_bytes=size_bytes,
+                upload_id=str(transfer["id"]),
+            )
+        await self.start(run_id)
+        if stream:
+            return self.stream_events(run_id)
+        return await self.wait_for_terminal(
+            run_id, timeout_seconds=wait_timeout_seconds
+        )
+
     async def start(
         self,
         workspace_run_id: str,
@@ -895,16 +1268,27 @@ class AsyncWorkspaceRunsClient:
     async def list(
         self,
         *,
+        cursor: str | None = None,
+        limit: int | None = None,
         metadata: Metadata | None = None,
         project_id: str | None = None,
         status: WorkspaceRunStatus | None = None,
-    ) -> list[JsonObject]:
-        """List Workspace Runs visible to the configured credential."""
+    ) -> AsyncPage[JsonObject]:
+        """Return a page that asynchronously iterates through Workspace Runs."""
         response = await self._transport.request(
-            f"/v1/workspace-runs{_workspace_run_list_query(metadata, project_id, status)}",
+            f"/v1/workspace-runs{_workspace_run_list_query(metadata, project_id, status, limit, cursor)}",
             method="GET",
         )
-        return list(response["data"])
+        return AsyncPage(
+            response,
+            lambda next_cursor: self.list(
+                cursor=next_cursor,
+                limit=limit,
+                metadata=metadata,
+                project_id=project_id,
+                status=status,
+            ),
+        )
 
     async def list_events(
         self,
@@ -935,6 +1319,38 @@ class AsyncWorkspaceRunsClient:
             reconnect=reconnect,
         ):
             yield event
+
+    async def wait_until_done(
+        self,
+        workspace_run_id: str,
+        *,
+        interval_seconds: float = 1.0,
+        timeout_seconds: float = 600.0,
+    ) -> JsonObject:
+        """Poll until a Workspace Run reaches a terminal status."""
+        return await self.wait_for_terminal(
+            workspace_run_id,
+            initial_interval_seconds=interval_seconds,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def wait_for_terminal(
+        self,
+        workspace_run_id: str,
+        *,
+        initial_interval_seconds: float = 0.25,
+        max_interval_seconds: float = 4.0,
+        timeout_seconds: float = 600.0,
+    ) -> JsonObject:
+        """Poll with backoff until a Workspace Run reaches a terminal state."""
+        return await _async_wait_for_value(
+            lambda: self.get(workspace_run_id),
+            lambda run: str(run.get("status")) in {"succeeded", "failed", "canceled"},
+            description=f"Workspace Run {workspace_run_id} to finish",
+            initial_interval_seconds=initial_interval_seconds,
+            max_interval_seconds=max_interval_seconds,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def cancel(
         self,
@@ -969,6 +1385,24 @@ class CommandsClient:
         response = self._transport.request(f"/v1/commands/{command_id}", method="GET")
         return response["command"]
 
+    def wait(
+        self,
+        command_id: str,
+        *,
+        initial_interval_seconds: float = 0.25,
+        max_interval_seconds: float = 4.0,
+        timeout_seconds: float = 600.0,
+    ) -> JsonObject:
+        """Poll with backoff until a Command reaches a terminal state."""
+        return _wait_for_value(
+            lambda: self.get(command_id),
+            lambda command: command.get("status") in _TERMINAL_COMMAND_STATUSES,
+            description=f"Command {command_id} to finish",
+            initial_interval_seconds=initial_interval_seconds,
+            max_interval_seconds=max_interval_seconds,
+            timeout_seconds=timeout_seconds,
+        )
+
     def cancel(
         self,
         command_id: str,
@@ -984,31 +1418,46 @@ class CommandsClient:
         *,
         after_seq: int | None = None,
         limit: int | None = None,
-    ) -> list[JsonObject]:
+    ) -> JsonObject:
         """Read bounded Command log chunks for a Command id."""
         response = self._transport.request(
             f"/v1/commands/{command_id}/logs{_command_log_query(after_seq, limit)}",
             method="GET",
         )
-        return list(response["data"])
+        return response
 
     def run(
         self,
         sandbox_id: str,
         command: str,
-        **options: Any,
+        *,
+        background: bool = False,
+        collect: Sequence[CommandCollectRequest] | None = None,
+        collect_on: CommandCollectOn | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        idempotency_key: str | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stream_error: Callable[[BaseException], None] | None = None,
+        timeout_ms: int | None = None,
     ) -> JsonObject:
-        """Run a Command in a Sandbox and return completed Command metadata."""
-        return _run_command(self._transport, sandbox_id, command, "run", **options)
-
-    def start(
-        self,
-        sandbox_id: str,
-        command: str,
-        **options: Any,
-    ) -> JsonObject:
-        """Start a Command in a Sandbox and return started Command metadata."""
-        return _run_command(self._transport, sandbox_id, command, "start", **options)
+        """Run a Command, returning immediately when ``background`` is true."""
+        return _run_command(
+            self._transport,
+            sandbox_id,
+            command,
+            background=background,
+            collect=collect,
+            collect_on=collect_on,
+            cwd=cwd,
+            env=env,
+            idempotency_key=idempotency_key,
+            on_stderr=on_stderr,
+            on_stdout=on_stdout,
+            on_stream_error=on_stream_error,
+            timeout_ms=timeout_ms,
+        )
 
     def stream_logs(
         self,
@@ -1038,6 +1487,24 @@ class AsyncCommandsClient:
         )
         return response["command"]
 
+    async def wait(
+        self,
+        command_id: str,
+        *,
+        initial_interval_seconds: float = 0.25,
+        max_interval_seconds: float = 4.0,
+        timeout_seconds: float = 600.0,
+    ) -> JsonObject:
+        """Poll with backoff until a Command reaches a terminal state."""
+        return await _async_wait_for_value(
+            lambda: self.get(command_id),
+            lambda command: command.get("status") in _TERMINAL_COMMAND_STATUSES,
+            description=f"Command {command_id} to finish",
+            initial_interval_seconds=initial_interval_seconds,
+            max_interval_seconds=max_interval_seconds,
+            timeout_seconds=timeout_seconds,
+        )
+
     async def cancel(
         self,
         command_id: str,
@@ -1053,42 +1520,45 @@ class AsyncCommandsClient:
         *,
         after_seq: int | None = None,
         limit: int | None = None,
-    ) -> list[JsonObject]:
+    ) -> JsonObject:
         """Read bounded Command log chunks for a Command id."""
         response = await self._transport.request(
             f"/v1/commands/{command_id}/logs{_command_log_query(after_seq, limit)}",
             method="GET",
         )
-        return list(response["data"])
+        return response
 
     async def run(
         self,
         sandbox_id: str,
         command: str,
-        **options: Any,
+        *,
+        background: bool = False,
+        collect: Sequence[CommandCollectRequest] | None = None,
+        collect_on: CommandCollectOn | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        idempotency_key: str | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stream_error: Callable[[BaseException], None] | None = None,
+        timeout_ms: int | None = None,
     ) -> JsonObject:
-        """Run a Command in a Sandbox and return completed Command metadata."""
+        """Run a Command, returning immediately when ``background`` is true."""
         return await _async_run_command(
             self._transport,
             sandbox_id,
             command,
-            "run",
-            **options,
-        )
-
-    async def start(
-        self,
-        sandbox_id: str,
-        command: str,
-        **options: Any,
-    ) -> JsonObject:
-        """Start a Command in a Sandbox and return started Command metadata."""
-        return await _async_run_command(
-            self._transport,
-            sandbox_id,
-            command,
-            "start",
-            **options,
+            background=background,
+            collect=collect,
+            collect_on=collect_on,
+            cwd=cwd,
+            env=env,
+            idempotency_key=idempotency_key,
+            on_stderr=on_stderr,
+            on_stdout=on_stdout,
+            on_stream_error=on_stream_error,
+            timeout_ms=timeout_ms,
         )
 
     async def stream_logs(
@@ -1120,7 +1590,7 @@ class FilesClient:
         """Create or reuse a short-lived download URL for a Workspace file."""
         return _file_download_url(self._transport, sandbox_id, path)
 
-    def list(self, sandbox_id: str, path: str = "/workspace") -> list[JsonObject]:
+    def list(self, sandbox_id: str, path: str = "/workspace") -> JsonObject:
         """List files and directories under a Sandbox Workspace path."""
         return _list_files(self._transport, sandbox_id, path)
 
@@ -1226,7 +1696,7 @@ class AsyncFilesClient:
         self,
         sandbox_id: str,
         path: str = "/workspace",
-    ) -> list[JsonObject]:
+    ) -> JsonObject:
         """List files and directories under a Sandbox Workspace path."""
         return await _async_list_files(self._transport, sandbox_id, path)
 
@@ -1265,7 +1735,9 @@ class AsyncFilesClient:
         encoding: FileEncoding | None = None,
     ) -> str:
         """Read a small Workspace file as text."""
-        return await _async_read_file(self._transport, sandbox_id, path, encoding=encoding)
+        return await _async_read_file(
+            self._transport, sandbox_id, path, encoding=encoding
+        )
 
     async def read_bytes(self, sandbox_id: str, path: str) -> bytes:
         """Read a small file as bytes via the API's direct base64 file limit."""
@@ -1329,7 +1801,7 @@ class SandboxFilesClient:
         """Create or reuse a short-lived download URL for a file in this Sandbox."""
         return _file_download_url(self._transport, self._sandbox_id, path)
 
-    def list(self, path: str = "/workspace") -> list[JsonObject]:
+    def list(self, path: str = "/workspace") -> JsonObject:
         """List files and directories under a Workspace path in this Sandbox."""
         return _list_files(self._transport, self._sandbox_id, path)
 
@@ -1417,7 +1889,7 @@ class AsyncSandboxFilesClient:
         """Create or reuse a short-lived download URL for a file in this Sandbox."""
         return await _async_file_download_url(self._transport, self._sandbox_id, path)
 
-    async def list(self, path: str = "/workspace") -> list[JsonObject]:
+    async def list(self, path: str = "/workspace") -> JsonObject:
         """List files and directories under a Workspace path in this Sandbox."""
         return await _async_list_files(self._transport, self._sandbox_id, path)
 
@@ -1550,9 +2022,15 @@ class ArtifactsClient:
         )
         return response["artifact"]
 
-    def list(self, sandbox_id: str) -> list[JsonObject]:
-        """List Artifact metadata records for a Sandbox."""
-        return _list_artifacts(self._transport, sandbox_id)
+    def list(
+        self,
+        sandbox_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Page[JsonObject]:
+        """Return an auto-paginating Artifact page for a Sandbox."""
+        return _list_artifacts(self._transport, sandbox_id, cursor=cursor, limit=limit)
 
 
 class AsyncArtifactsClient:
@@ -1603,9 +2081,17 @@ class AsyncArtifactsClient:
         )
         return response["artifact"]
 
-    async def list(self, sandbox_id: str) -> list[JsonObject]:
-        """List Artifact metadata records for a Sandbox."""
-        return await _async_list_artifacts(self._transport, sandbox_id)
+    async def list(
+        self,
+        sandbox_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> AsyncPage[JsonObject]:
+        """Return an async auto-paginating Artifact page for a Sandbox."""
+        return await _async_list_artifacts(
+            self._transport, sandbox_id, cursor=cursor, limit=limit
+        )
 
 
 class SandboxArtifactsClient:
@@ -1629,9 +2115,40 @@ class SandboxArtifactsClient:
             name=name,
         )
 
-    def list(self) -> list[JsonObject]:
-        """List Artifact metadata records for this Sandbox."""
-        return _list_artifacts(self._transport, self._sandbox_id)
+    def list(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> Page[JsonObject]:
+        """Return an auto-paginating Artifact page for this Sandbox."""
+        return _list_artifacts(
+            self._transport, self._sandbox_id, cursor=cursor, limit=limit
+        )
+
+    def delete(self, artifact_id: str) -> JsonObject:
+        """Delete an Artifact by id and return deleted metadata."""
+        response = self._transport.request(
+            f"/v1/artifacts/{artifact_id}",
+            method="DELETE",
+        )
+        return response["artifact"]
+
+    def download(self, artifact_id: str) -> bytes:
+        """Download raw Artifact bytes by id."""
+        return self._transport.download(f"/v1/artifacts/{artifact_id}/download")
+
+    def download_url(self, artifact_id: str) -> JsonObject:
+        """Create or reuse a short-lived Artifact download URL."""
+        return self._transport.request(
+            f"/v1/artifacts/{artifact_id}/download-url",
+            method="POST",
+        )
+
+    def get(self, artifact_id: str) -> JsonObject:
+        """Return Artifact metadata by id."""
+        response = self._transport.request(
+            f"/v1/artifacts/{artifact_id}",
+            method="GET",
+        )
+        return response["artifact"]
 
 
 class AsyncSandboxArtifactsClient:
@@ -1655,9 +2172,40 @@ class AsyncSandboxArtifactsClient:
             name=name,
         )
 
-    async def list(self) -> list[JsonObject]:
-        """List Artifact metadata records for this Sandbox."""
-        return await _async_list_artifacts(self._transport, self._sandbox_id)
+    async def list(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> AsyncPage[JsonObject]:
+        """Return an async auto-paginating Artifact page for this Sandbox."""
+        return await _async_list_artifacts(
+            self._transport, self._sandbox_id, cursor=cursor, limit=limit
+        )
+
+    async def delete(self, artifact_id: str) -> JsonObject:
+        """Delete an Artifact by id and return deleted metadata."""
+        response = await self._transport.request(
+            f"/v1/artifacts/{artifact_id}",
+            method="DELETE",
+        )
+        return response["artifact"]
+
+    async def download(self, artifact_id: str) -> bytes:
+        """Download raw Artifact bytes by id."""
+        return await self._transport.download(f"/v1/artifacts/{artifact_id}/download")
+
+    async def download_url(self, artifact_id: str) -> JsonObject:
+        """Create or reuse a short-lived Artifact download URL."""
+        return await self._transport.request(
+            f"/v1/artifacts/{artifact_id}/download-url",
+            method="POST",
+        )
+
+    async def get(self, artifact_id: str) -> JsonObject:
+        """Return Artifact metadata by id."""
+        response = await self._transport.request(
+            f"/v1/artifacts/{artifact_id}",
+            method="GET",
+        )
+        return response["artifact"]
 
 
 class PreviewsClient:
@@ -1679,9 +2227,15 @@ class PreviewsClient:
         response = self._transport.request(f"/v1/previews/{preview_id}", method="GET")
         return response["preview"]
 
-    def list(self, sandbox_id: str) -> list[JsonObject]:
-        """List Preview metadata records for a Sandbox."""
-        return _list_previews(self._transport, sandbox_id)
+    def list(
+        self,
+        sandbox_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Page[JsonObject]:
+        """Return an auto-paginating Preview page for a Sandbox."""
+        return _list_previews(self._transport, sandbox_id, cursor=cursor, limit=limit)
 
     def revoke(self, preview_id: str) -> JsonObject:
         """Revoke a Preview by id and return revoked metadata."""
@@ -1719,9 +2273,17 @@ class AsyncPreviewsClient:
         )
         return response["preview"]
 
-    async def list(self, sandbox_id: str) -> list[JsonObject]:
-        """List Preview metadata records for a Sandbox."""
-        return await _async_list_previews(self._transport, sandbox_id)
+    async def list(
+        self,
+        sandbox_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> AsyncPage[JsonObject]:
+        """Return an async auto-paginating Preview page for a Sandbox."""
+        return await _async_list_previews(
+            self._transport, sandbox_id, cursor=cursor, limit=limit
+        )
 
     async def revoke(self, preview_id: str) -> JsonObject:
         """Revoke a Preview by id and return revoked metadata."""
@@ -1751,9 +2313,26 @@ class SandboxPreviewsClient:
             auth_mode=auth_mode,
         )
 
-    def list(self) -> list[JsonObject]:
-        """List Preview metadata records for this Sandbox."""
-        return _list_previews(self._transport, self._sandbox_id)
+    def list(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> Page[JsonObject]:
+        """Return an auto-paginating Preview page for this Sandbox."""
+        return _list_previews(
+            self._transport, self._sandbox_id, cursor=cursor, limit=limit
+        )
+
+    def get(self, preview_id: str) -> JsonObject:
+        """Return Preview metadata by id."""
+        response = self._transport.request(f"/v1/previews/{preview_id}", method="GET")
+        return response["preview"]
+
+    def revoke(self, preview_id: str) -> JsonObject:
+        """Revoke a Preview by id and return revoked metadata."""
+        response = self._transport.request(
+            f"/v1/previews/{preview_id}",
+            method="DELETE",
+        )
+        return response["preview"]
 
 
 class AsyncSandboxPreviewsClient:
@@ -1775,9 +2354,29 @@ class AsyncSandboxPreviewsClient:
             auth_mode=auth_mode,
         )
 
-    async def list(self) -> list[JsonObject]:
-        """List Preview metadata records for this Sandbox."""
-        return await _async_list_previews(self._transport, self._sandbox_id)
+    async def list(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> AsyncPage[JsonObject]:
+        """Return an async auto-paginating Preview page for this Sandbox."""
+        return await _async_list_previews(
+            self._transport, self._sandbox_id, cursor=cursor, limit=limit
+        )
+
+    async def get(self, preview_id: str) -> JsonObject:
+        """Return Preview metadata by id."""
+        response = await self._transport.request(
+            f"/v1/previews/{preview_id}",
+            method="GET",
+        )
+        return response["preview"]
+
+    async def revoke(self, preview_id: str) -> JsonObject:
+        """Revoke a Preview by id and return revoked metadata."""
+        response = await self._transport.request(
+            f"/v1/previews/{preview_id}",
+            method="DELETE",
+        )
+        return response["preview"]
 
 
 class ProjectsClient:
@@ -1793,10 +2392,17 @@ class ProjectsClient:
         )
         return response["project"]
 
-    def list(self) -> list[JsonObject]:
-        """List Projects visible to the configured credential."""
-        response = self._transport.request("/v1/projects", method="GET")
-        return list(response["data"])
+    def list(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> Page[JsonObject]:
+        """Return a page that iterates through all visible Projects."""
+        response = self._transport.request(
+            f"/v1/projects{_cursor_query(cursor, limit)}", method="GET"
+        )
+        return Page(
+            response,
+            lambda next_cursor: self.list(cursor=next_cursor, limit=limit),
+        )
 
 
 class AsyncProjectsClient:
@@ -1812,10 +2418,17 @@ class AsyncProjectsClient:
         )
         return response["project"]
 
-    async def list(self) -> list[JsonObject]:
-        """List Projects visible to the configured credential."""
-        response = await self._transport.request("/v1/projects", method="GET")
-        return list(response["data"])
+    async def list(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> AsyncPage[JsonObject]:
+        """Return a page that asynchronously iterates through Projects."""
+        response = await self._transport.request(
+            f"/v1/projects{_cursor_query(cursor, limit)}", method="GET"
+        )
+        return AsyncPage(
+            response,
+            lambda next_cursor: self.list(cursor=next_cursor, limit=limit),
+        )
 
 
 class ApiKeysClient:
@@ -1830,10 +2443,17 @@ class ApiKeysClient:
         )
         return response["apiKey"]
 
-    def list(self) -> list[JsonObject]:
-        """List API Key metadata visible to the configured credential."""
-        response = self._transport.request("/v1/api-keys", method="GET")
-        return list(response["data"])
+    def list(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> Page[JsonObject]:
+        """Return a page that iterates through visible API Key metadata."""
+        response = self._transport.request(
+            f"/v1/api-keys{_cursor_query(cursor, limit)}", method="GET"
+        )
+        return Page(
+            response,
+            lambda next_cursor: self.list(cursor=next_cursor, limit=limit),
+        )
 
     def revoke(self, api_key_id: str) -> JsonObject:
         """Revoke an API Key by id and return revoked metadata."""
@@ -1856,10 +2476,17 @@ class AsyncApiKeysClient:
         )
         return response["apiKey"]
 
-    async def list(self) -> list[JsonObject]:
-        """List API Key metadata visible to the configured credential."""
-        response = await self._transport.request("/v1/api-keys", method="GET")
-        return list(response["data"])
+    async def list(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> AsyncPage[JsonObject]:
+        """Return a page that asynchronously iterates through API Keys."""
+        response = await self._transport.request(
+            f"/v1/api-keys{_cursor_query(cursor, limit)}", method="GET"
+        )
+        return AsyncPage(
+            response,
+            lambda next_cursor: self.list(cursor=next_cursor, limit=limit),
+        )
 
     async def revoke(self, api_key_id: str) -> JsonObject:
         """Revoke an API Key by id and return revoked metadata."""
@@ -1884,18 +2511,70 @@ class SandboxCommandsClient:
         """Cancel a Command in this Sandbox and return updated metadata."""
         return _cancel_command(self._transport, command_id, mode=mode)
 
-    def run(self, command: str, **options: Any) -> JsonObject:
-        """Run a Command in this Sandbox and return completed metadata."""
-        return _run_command(self._transport, self._sandbox_id, command, "run", **options)
+    def get(self, command_id: str) -> JsonObject:
+        """Return Command metadata for a Command id."""
+        response = self._transport.request(f"/v1/commands/{command_id}", method="GET")
+        return response["command"]
 
-    def start(self, command: str, **options: Any) -> JsonObject:
-        """Start a Command in this Sandbox and return started metadata."""
+    def logs(
+        self,
+        command_id: str,
+        *,
+        after_seq: int | None = None,
+        limit: int | None = None,
+    ) -> JsonObject:
+        """Read bounded Command log chunks for a Command id."""
+        response = self._transport.request(
+            f"/v1/commands/{command_id}/logs{_command_log_query(after_seq, limit)}",
+            method="GET",
+        )
+        return response
+
+    def run(
+        self,
+        command: str,
+        *,
+        background: bool = False,
+        collect: Sequence[CommandCollectRequest] | None = None,
+        collect_on: CommandCollectOn | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        idempotency_key: str | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stream_error: Callable[[BaseException], None] | None = None,
+        timeout_ms: int | None = None,
+    ) -> JsonObject:
+        """Run a Command, returning immediately when ``background`` is true."""
         return _run_command(
             self._transport,
             self._sandbox_id,
             command,
-            "start",
-            **options,
+            background=background,
+            collect=collect,
+            collect_on=collect_on,
+            cwd=cwd,
+            env=env,
+            idempotency_key=idempotency_key,
+            on_stderr=on_stderr,
+            on_stdout=on_stdout,
+            on_stream_error=on_stream_error,
+            timeout_ms=timeout_ms,
+        )
+
+    def stream_logs(
+        self,
+        command_id: str,
+        *,
+        after_seq: int | None = None,
+        reconnect: bool = True,
+    ) -> Iterator[JsonObject]:
+        """Stream Command log events for a Command id."""
+        yield from _stream_logs(
+            self._transport,
+            command_id,
+            after_seq=after_seq,
+            reconnect=reconnect,
         )
 
 
@@ -1913,25 +2592,75 @@ class AsyncSandboxCommandsClient:
         """Cancel a Command in this Sandbox and return updated metadata."""
         return await _async_cancel_command(self._transport, command_id, mode=mode)
 
-    async def run(self, command: str, **options: Any) -> JsonObject:
-        """Run a Command in this Sandbox and return completed metadata."""
+    async def get(self, command_id: str) -> JsonObject:
+        """Return Command metadata for a Command id."""
+        response = await self._transport.request(
+            f"/v1/commands/{command_id}",
+            method="GET",
+        )
+        return response["command"]
+
+    async def logs(
+        self,
+        command_id: str,
+        *,
+        after_seq: int | None = None,
+        limit: int | None = None,
+    ) -> JsonObject:
+        """Read bounded Command log chunks for a Command id."""
+        response = await self._transport.request(
+            f"/v1/commands/{command_id}/logs{_command_log_query(after_seq, limit)}",
+            method="GET",
+        )
+        return response
+
+    async def run(
+        self,
+        command: str,
+        *,
+        background: bool = False,
+        collect: Sequence[CommandCollectRequest] | None = None,
+        collect_on: CommandCollectOn | None = None,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        idempotency_key: str | None = None,
+        on_stderr: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stream_error: Callable[[BaseException], None] | None = None,
+        timeout_ms: int | None = None,
+    ) -> JsonObject:
+        """Run a Command, returning immediately when ``background`` is true."""
         return await _async_run_command(
             self._transport,
             self._sandbox_id,
             command,
-            "run",
-            **options,
+            background=background,
+            collect=collect,
+            collect_on=collect_on,
+            cwd=cwd,
+            env=env,
+            idempotency_key=idempotency_key,
+            on_stderr=on_stderr,
+            on_stdout=on_stdout,
+            on_stream_error=on_stream_error,
+            timeout_ms=timeout_ms,
         )
 
-    async def start(self, command: str, **options: Any) -> JsonObject:
-        """Start a Command in this Sandbox and return started metadata."""
-        return await _async_run_command(
+    async def stream_logs(
+        self,
+        command_id: str,
+        *,
+        after_seq: int | None = None,
+        reconnect: bool = True,
+    ) -> AsyncIterator[JsonObject]:
+        """Stream Command log events for a Command id."""
+        async for event in _async_stream_logs(
             self._transport,
-            self._sandbox_id,
-            command,
-            "start",
-            **options,
-        )
+            command_id,
+            after_seq=after_seq,
+            reconnect=reconnect,
+        ):
+            yield event
 
 
 class SandboxCodeClient:
@@ -1965,9 +2694,13 @@ class SandboxCodeClient:
         """Return Code Context metadata in this Sandbox."""
         return _get_code_context(self._transport, self._sandbox_id, context_id)
 
-    def list_contexts(self) -> list[JsonObject]:
-        """List Code Context metadata records in this Sandbox."""
-        return _list_code_contexts(self._transport, self._sandbox_id)
+    def list_contexts(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> Page[JsonObject]:
+        """Return an auto-paginating Code Context page in this Sandbox."""
+        return _list_code_contexts(
+            self._transport, self._sandbox_id, cursor=cursor, limit=limit
+        )
 
     def run(
         self,
@@ -2057,9 +2790,13 @@ class AsyncSandboxCodeClient:
             context_id,
         )
 
-    async def list_contexts(self) -> list[JsonObject]:
-        """List Code Context metadata records in this Sandbox."""
-        return await _async_list_code_contexts(self._transport, self._sandbox_id)
+    async def list_contexts(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> AsyncPage[JsonObject]:
+        """Return an async auto-paginating Code Context page in this Sandbox."""
+        return await _async_list_code_contexts(
+            self._transport, self._sandbox_id, cursor=cursor, limit=limit
+        )
 
     async def run(
         self,
@@ -2115,8 +2852,8 @@ def _run_command(
     transport: SyncTransport,
     sandbox_id: str,
     command: str,
-    mode: str,
     *,
+    background: bool = False,
     collect: Sequence[CommandCollectRequest] | None = None,
     collect_on: CommandCollectOn | None = None,
     cwd: str | None = None,
@@ -2128,24 +2865,26 @@ def _run_command(
     require_command_read: bool | None = None,
     timeout_ms: int | None = None,
 ) -> JsonObject:
+    if background and (collect is not None or collect_on is not None):
+        raise ValueError("collect and collect_on require background=False.")
     if on_stderr or on_stdout or on_stream_error:
         callbacks = _CommandCallbacks(
             on_stderr=on_stderr,
             on_stdout=on_stdout,
             on_stream_error=on_stream_error,
         )
-        if mode == "run" and (collect is not None or collect_on is not None):
+        if collect is not None or collect_on is not None:
             terminal_command = _run_command(
                 transport,
                 sandbox_id,
                 command,
-                "run",
+                background=False,
                 collect=collect,
                 collect_on=collect_on,
                 cwd=cwd,
                 env=env,
                 idempotency_key=idempotency_key,
-                require_command_read=_callback_run_requires_command_read(mode),
+                require_command_read=True,
                 timeout_ms=timeout_ms,
             )
             _replay_command_logs(transport, str(terminal_command["id"]), callbacks)
@@ -2155,17 +2894,17 @@ def _run_command(
             transport,
             sandbox_id,
             command,
-            "start",
+            background=True,
             cwd=cwd,
             env=env,
             idempotency_key=idempotency_key,
             on_stderr=None,
             on_stdout=None,
             on_stream_error=None,
-            require_command_read=_callback_run_requires_command_read(mode),
-            timeout_ms=_callback_run_timeout_ms(mode, timeout_ms),
+            require_command_read=_callback_run_requires_command_read(background),
+            timeout_ms=_callback_run_timeout_ms(background, timeout_ms),
         )
-        if mode == "start":
+        if background:
             _start_pump_thread(transport, str(command_response["id"]), callbacks)
             return command_response
         return _consume_stream_until_terminal_or_poll(
@@ -2177,7 +2916,7 @@ def _run_command(
     path, body = _run_command_request(
         sandbox_id,
         command,
-        mode,
+        background=background,
         collect=collect,
         collect_on=collect_on,
         cwd=cwd,
@@ -2199,8 +2938,8 @@ async def _async_run_command(
     transport: AsyncTransport,
     sandbox_id: str,
     command: str,
-    mode: str,
     *,
+    background: bool = False,
     collect: Sequence[CommandCollectRequest] | None = None,
     collect_on: CommandCollectOn | None = None,
     cwd: str | None = None,
@@ -2212,24 +2951,26 @@ async def _async_run_command(
     require_command_read: bool | None = None,
     timeout_ms: int | None = None,
 ) -> JsonObject:
+    if background and (collect is not None or collect_on is not None):
+        raise ValueError("collect and collect_on require background=False.")
     if on_stderr or on_stdout or on_stream_error:
         callbacks = _CommandCallbacks(
             on_stderr=on_stderr,
             on_stdout=on_stdout,
             on_stream_error=on_stream_error,
         )
-        if mode == "run" and (collect is not None or collect_on is not None):
+        if collect is not None or collect_on is not None:
             terminal_command = await _async_run_command(
                 transport,
                 sandbox_id,
                 command,
-                "run",
+                background=False,
                 collect=collect,
                 collect_on=collect_on,
                 cwd=cwd,
                 env=env,
                 idempotency_key=idempotency_key,
-                require_command_read=_callback_run_requires_command_read(mode),
+                require_command_read=True,
                 timeout_ms=timeout_ms,
             )
             await _async_replay_command_logs(
@@ -2243,17 +2984,17 @@ async def _async_run_command(
             transport,
             sandbox_id,
             command,
-            "start",
+            background=True,
             cwd=cwd,
             env=env,
             idempotency_key=idempotency_key,
             on_stderr=None,
             on_stdout=None,
             on_stream_error=None,
-            require_command_read=_callback_run_requires_command_read(mode),
-            timeout_ms=_callback_run_timeout_ms(mode, timeout_ms),
+            require_command_read=_callback_run_requires_command_read(background),
+            timeout_ms=_callback_run_timeout_ms(background, timeout_ms),
         )
-        if mode == "start":
+        if background:
             _start_async_pump_task(transport, str(command_response["id"]), callbacks)
             return command_response
         return await _async_consume_stream_until_terminal_or_poll(
@@ -2265,7 +3006,7 @@ async def _async_run_command(
     path, body = _run_command_request(
         sandbox_id,
         command,
-        mode,
+        background=background,
         collect=collect,
         collect_on=collect_on,
         cwd=cwd,
@@ -2283,14 +3024,14 @@ async def _async_run_command(
     return response["command"]
 
 
-def _callback_run_timeout_ms(mode: str, timeout_ms: int | None) -> int | None:
-    if mode == "run" and timeout_ms is None:
+def _callback_run_timeout_ms(background: bool, timeout_ms: int | None) -> int | None:
+    if not background and timeout_ms is None:
         return _DEFAULT_BLOCKING_COMMAND_TIMEOUT_MS
     return timeout_ms
 
 
-def _callback_run_requires_command_read(mode: str) -> bool | None:
-    return True if mode == "run" else None
+def _callback_run_requires_command_read(background: bool) -> bool | None:
+    return None if background else True
 
 
 def _cancel_command(
@@ -2446,6 +3187,66 @@ class _CommandCallbacks:
 
 _STREAM_RECONNECT_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0)
 _TERMINAL_COMMAND_STATUSES = {"exited", "failed", "canceled", "timed_out", "killed"}
+_MAX_DIRECT_ARCHIVE_BYTES = 8 * 1024 * 1024
+_T = TypeVar("_T")
+
+
+def _wait_for_value(
+    fetch: Callable[[], _T],
+    ready: Callable[[_T], bool],
+    *,
+    description: str,
+    initial: _T | None = None,
+    initial_interval_seconds: float,
+    max_interval_seconds: float,
+    terminal: Callable[[_T], bool] | None = None,
+    timeout_seconds: float,
+) -> _T:
+    deadline = time.monotonic() + timeout_seconds
+    delay = max(0.0, initial_interval_seconds)
+    value = initial
+    while True:
+        if value is None:
+            value = fetch()
+        if ready(value):
+            return value
+        if terminal is not None and terminal(value):
+            raise RuntimeError(f"{description} reached a terminal state.")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for {description}.")
+        time.sleep(delay)
+        delay = min(max_interval_seconds, max(delay * 2, 0.01))
+        value = fetch()
+
+
+async def _async_wait_for_value(
+    fetch: Callable[[], Awaitable[_T]],
+    ready: Callable[[_T], bool],
+    *,
+    description: str,
+    initial: _T | None = None,
+    initial_interval_seconds: float,
+    max_interval_seconds: float,
+    terminal: Callable[[_T], bool] | None = None,
+    timeout_seconds: float,
+) -> _T:
+    deadline = time.monotonic() + timeout_seconds
+    delay = max(0.0, initial_interval_seconds)
+    value = initial
+    while True:
+        if value is None:
+            value = await fetch()
+        if ready(value):
+            return value
+        if terminal is not None and terminal(value):
+            raise RuntimeError(f"{description} reached a terminal state.")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for {description}.")
+        await asyncio.sleep(delay)
+        delay = min(max_interval_seconds, max(delay * 2, 0.01))
+        value = await fetch()
+
+
 _DEFAULT_BLOCKING_COMMAND_TIMEOUT_MS = 60_000
 
 
@@ -2765,10 +3566,26 @@ def _create_sandbox_body(
     )
 
 
-def _sandbox_list_query(metadata: Metadata | None) -> str:
-    if not metadata:
-        return ""
-    return f"?{urlencode({f'metadata.{key}': value for key, value in metadata.items()})}"
+def _sandbox_list_query(
+    metadata: Metadata | None,
+    limit: int | None = None,
+    cursor: str | None = None,
+) -> str:
+    params = {f"metadata.{key}": value for key, value in (metadata or {}).items()}
+    if limit is not None:
+        params["limit"] = str(limit)
+    if cursor is not None:
+        params["cursor"] = cursor
+    return f"?{urlencode(params)}" if params else ""
+
+
+def _cursor_query(cursor: str | None, limit: int | None) -> str:
+    params: dict[str, str] = {}
+    if cursor is not None:
+        params["cursor"] = cursor
+    if limit is not None:
+        params["limit"] = str(limit)
+    return f"?{urlencode(params)}" if params else ""
 
 
 def _workspace_run_body(
@@ -2804,8 +3621,14 @@ def _workspace_run_list_query(
     metadata: Metadata | None,
     project_id: str | None,
     status: WorkspaceRunStatus | None,
+    limit: int | None,
+    cursor: str | None = None,
 ) -> str:
     params: dict[str, str] = {}
+    if limit is not None:
+        params["limit"] = str(limit)
+    if cursor is not None:
+        params["cursor"] = cursor
     if project_id is not None:
         params["projectId"] = project_id
     if status is not None:
@@ -2832,8 +3655,8 @@ def _string_headers(value: object) -> dict[str, str]:
 def _run_command_request(
     sandbox_id: str,
     command: str,
-    mode: str,
     *,
+    background: bool = False,
     collect: Sequence[CommandCollectRequest] | None = None,
     collect_on: CommandCollectOn | None = None,
     cwd: str | None = None,
@@ -2842,9 +3665,10 @@ def _run_command_request(
     timeout_ms: int | None = None,
 ) -> tuple[str, JsonObject]:
     return (
-        f"/v1/sandboxes/{sandbox_id}/commands/{mode}",
+        f"/v1/sandboxes/{sandbox_id}/commands",
         _compact(
             {
+                "background": background,
                 "collect": collect,
                 "collectOn": collect_on,
                 "command": command,
@@ -2922,12 +3746,20 @@ def _get_code_context(
 def _list_code_contexts(
     transport: SyncTransport,
     sandbox_id: str,
-) -> list[JsonObject]:
+    *,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> Page[JsonObject]:
     response = transport.request(
-        f"/v1/sandboxes/{sandbox_id}/code/contexts",
+        f"/v1/sandboxes/{sandbox_id}/code/contexts{_cursor_query(cursor, limit)}",
         method="GET",
     )
-    return list(response["data"])
+    return Page(
+        response,
+        lambda next_cursor: _list_code_contexts(
+            transport, sandbox_id, cursor=next_cursor, limit=limit
+        ),
+    )
 
 
 async def _async_delete_code_context(
@@ -2957,12 +3789,20 @@ async def _async_get_code_context(
 async def _async_list_code_contexts(
     transport: AsyncTransport,
     sandbox_id: str,
-) -> list[JsonObject]:
+    *,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> AsyncPage[JsonObject]:
     response = await transport.request(
-        f"/v1/sandboxes/{sandbox_id}/code/contexts",
+        f"/v1/sandboxes/{sandbox_id}/code/contexts{_cursor_query(cursor, limit)}",
         method="GET",
     )
-    return list(response["data"])
+    return AsyncPage(
+        response,
+        lambda next_cursor: _async_list_code_contexts(
+            transport, sandbox_id, cursor=next_cursor, limit=limit
+        ),
+    )
 
 
 def _run_code(
@@ -3119,7 +3959,9 @@ async def _async_delete_file(
     sandbox_id: str,
     path: str,
 ) -> None:
-    await transport.request(_file_path(sandbox_id, "files", {"path": path}), method="DELETE")
+    await transport.request(
+        _file_path(sandbox_id, "files", {"path": path}), method="DELETE"
+    )
 
 
 def _file_download_url(
@@ -3150,24 +3992,24 @@ def _list_files(
     transport: SyncTransport,
     sandbox_id: str,
     path: str,
-) -> list[JsonObject]:
+) -> JsonObject:
     response = transport.request(
         _file_path(sandbox_id, "files", {"path": path}),
         method="GET",
     )
-    return list(response["data"])
+    return response
 
 
 async def _async_list_files(
     transport: AsyncTransport,
     sandbox_id: str,
     path: str,
-) -> list[JsonObject]:
+) -> JsonObject:
     response = await transport.request(
         _file_path(sandbox_id, "files", {"path": path}),
         method="GET",
     )
-    return list(response["data"])
+    return response
 
 
 def _mkdir(
@@ -3240,7 +4082,9 @@ def _read_file(
     encoding: FileEncoding | None = None,
 ) -> str:
     response = transport.request(
-        _file_path(sandbox_id, "files/read", _compact({"path": path, "encoding": encoding})),
+        _file_path(
+            sandbox_id, "files/read", _compact({"path": path, "encoding": encoding})
+        ),
         method="GET",
     )
     return str(response["content"])
@@ -3262,7 +4106,9 @@ async def _async_read_file(
     encoding: FileEncoding | None = None,
 ) -> str:
     response = await transport.request(
-        _file_path(sandbox_id, "files/read", _compact({"path": path, "encoding": encoding})),
+        _file_path(
+            sandbox_id, "files/read", _compact({"path": path, "encoding": encoding})
+        ),
         method="GET",
     )
     return str(response["content"])
@@ -3422,20 +4268,42 @@ async def _async_create_artifact(
     return response["artifact"]
 
 
-def _list_artifacts(transport: SyncTransport, sandbox_id: str) -> list[JsonObject]:
-    response = transport.request(f"/v1/sandboxes/{sandbox_id}/artifacts", method="GET")
-    return list(response["data"])
+def _list_artifacts(
+    transport: SyncTransport,
+    sandbox_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> Page[JsonObject]:
+    response = transport.request(
+        f"/v1/sandboxes/{sandbox_id}/artifacts{_cursor_query(cursor, limit)}",
+        method="GET",
+    )
+    return Page(
+        response,
+        lambda next_cursor: _list_artifacts(
+            transport, sandbox_id, cursor=next_cursor, limit=limit
+        ),
+    )
 
 
 async def _async_list_artifacts(
     transport: AsyncTransport,
     sandbox_id: str,
-) -> list[JsonObject]:
+    *,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> AsyncPage[JsonObject]:
     response = await transport.request(
-        f"/v1/sandboxes/{sandbox_id}/artifacts",
+        f"/v1/sandboxes/{sandbox_id}/artifacts{_cursor_query(cursor, limit)}",
         method="GET",
     )
-    return list(response["data"])
+    return AsyncPage(
+        response,
+        lambda next_cursor: _async_list_artifacts(
+            transport, sandbox_id, cursor=next_cursor, limit=limit
+        ),
+    )
 
 
 def _create_preview(
@@ -3468,20 +4336,42 @@ async def _async_create_preview(
     return response
 
 
-def _list_previews(transport: SyncTransport, sandbox_id: str) -> list[JsonObject]:
-    response = transport.request(f"/v1/sandboxes/{sandbox_id}/previews", method="GET")
-    return list(response["data"])
+def _list_previews(
+    transport: SyncTransport,
+    sandbox_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> Page[JsonObject]:
+    response = transport.request(
+        f"/v1/sandboxes/{sandbox_id}/previews{_cursor_query(cursor, limit)}",
+        method="GET",
+    )
+    return Page(
+        response,
+        lambda next_cursor: _list_previews(
+            transport, sandbox_id, cursor=next_cursor, limit=limit
+        ),
+    )
 
 
 async def _async_list_previews(
     transport: AsyncTransport,
     sandbox_id: str,
-) -> list[JsonObject]:
+    *,
+    cursor: str | None = None,
+    limit: int | None = None,
+) -> AsyncPage[JsonObject]:
     response = await transport.request(
-        f"/v1/sandboxes/{sandbox_id}/previews",
+        f"/v1/sandboxes/{sandbox_id}/previews{_cursor_query(cursor, limit)}",
         method="GET",
     )
-    return list(response["data"])
+    return AsyncPage(
+        response,
+        lambda next_cursor: _async_list_previews(
+            transport, sandbox_id, cursor=next_cursor, limit=limit
+        ),
+    )
 
 
 def _move_file_body(

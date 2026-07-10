@@ -1,4 +1,7 @@
-import { readFile as readFileBytes } from "node:fs/promises";
+import {
+  readFile as readFileBytes,
+  writeFile as writeFileBytes,
+} from "node:fs/promises";
 import { basename } from "node:path";
 
 import type { CrowNestClient } from "@crownest/sdk";
@@ -11,8 +14,9 @@ import {
   requiredArg,
   requiredPrefixedArg,
   stringFlag,
+  UsageError,
 } from "./flags";
-import type { CliResult } from "./index";
+import type { CliInput, CliResult } from "./index";
 import { jsonEnvelope, renderList, renderRecord } from "./output";
 
 export async function deleteFileCommand(
@@ -38,11 +42,11 @@ export async function listFilesCommand(
   const sandboxId = requiredSandboxId(parsed.positionals[0], "sandbox id");
   const path = parsed.positionals[1];
   rejectExtraPositionals(parsed.positionals.slice(2), "files list");
-  const files = await client().files.list(sandboxId, path);
+  const filesPage = await client().files.list(sandboxId, path);
   return ok(
     booleanFlag(parsed.flags, "--json")
-      ? jsonEnvelope(files)
-      : renderList(files, [
+      ? jsonEnvelope(filesPage.data)
+      : renderList(filesPage.data, [
           { key: "path" },
           { key: "type" },
           { key: "sizeBytes", label: "size" },
@@ -152,25 +156,81 @@ export async function uploadFileCommand(
   );
 }
 
-export async function writeFileCommand(
+export async function downloadFileCommand(
   client: () => CrowNestClient,
   args: readonly string[],
 ): Promise<CliResult> {
-  const [sandboxIdArg, pathArg, contentArg, ...flagArgs] = args;
-  const parsed = parseFlags(flagArgs, {
-    "--create-parents": "boolean",
+  const parsed = parseFlags(args, {
+    "--output": "string",
     ...jsonFlagSpec,
   });
+  const sandboxId = requiredSandboxId(parsed.positionals[0], "sandbox id");
+  const remotePath = requiredArg(parsed.positionals[1], "remote path");
+  const positionalOutput = parsed.positionals[2];
+  const flaggedOutput = stringFlag(parsed.flags, "--output");
+  if (positionalOutput !== undefined && flaggedOutput !== undefined) {
+    throw new UsageError(
+      "local path must be provided positionally or with --output, not both.",
+    );
+  }
+  const outputPath = flaggedOutput ?? positionalOutput ?? basename(remotePath);
+  rejectExtraPositionals(parsed.positionals.slice(3), "files download");
+
+  const bytes = await client().files.readBytes(sandboxId, remotePath);
+  await writeFileBytes(outputPath, bytes);
+  const result = { path: outputPath, remotePath, sizeBytes: bytes.byteLength };
+  return ok(
+    booleanFlag(parsed.flags, "--json") ? jsonEnvelope(result) : renderRecord(result),
+  );
+}
+
+export async function writeFileCommand(
+  client: () => CrowNestClient,
+  args: readonly string[],
+  input?: CliInput,
+): Promise<CliResult> {
+  const [sandboxIdArg, pathArg, contentOrFlag, ...remainingArgs] = args;
+  const contentIsFlag =
+    contentOrFlag === "--file" || contentOrFlag?.startsWith("--file=") === true;
+  const parsed = parseFlags(
+    contentIsFlag ? [contentOrFlag, ...remainingArgs] : remainingArgs,
+    {
+      "--create-parents": "boolean",
+      "--file": "string",
+      ...jsonFlagSpec,
+    },
+  );
   const sandboxId = requiredSandboxId(sandboxIdArg, "sandbox id");
   const path = requiredArg(pathArg, "path");
-  const content = requiredArg(contentArg, "content");
+  const positionalContent = contentIsFlag ? undefined : contentOrFlag;
+  const localPath = stringFlag(parsed.flags, "--file");
+  if (positionalContent !== undefined && localPath !== undefined) {
+    throw new UsageError(
+      "content must be provided positionally or with --file, not both.",
+    );
+  }
   rejectExtraPositionals(parsed.positionals, "files write");
+  const content =
+    localPath !== undefined
+      ? await readFileBytes(localPath, "utf8")
+      : positionalContent === "-"
+        ? await readInput(input)
+        : requiredArg(positionalContent, "content");
   const file = await client().files.write(sandboxId, path, content, {
     createParents: booleanFlag(parsed.flags, "--create-parents"),
   });
   return ok(
     booleanFlag(parsed.flags, "--json") ? jsonEnvelope(file) : renderRecord(file),
   );
+}
+
+async function readInput(input: CliInput | undefined): Promise<string> {
+  if (input === undefined) {
+    throw new UsageError("stdin is unavailable.");
+  }
+  let content = "";
+  for await (const chunk of input) content += chunk;
+  return content;
 }
 
 function requiredSandboxId(value: string | undefined, label: string): `sbx_${string}` {

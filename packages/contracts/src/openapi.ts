@@ -25,7 +25,10 @@ export const betaBackupScopeNotes = {
 } as const;
 
 export type PublicApiRouteSpec = {
+  readonly additionalSuccessStatuses?: readonly SuccessStatus[];
   readonly auth?: AuthMode;
+  readonly deprecated?: boolean;
+  readonly description?: string;
   readonly headerParams?: readonly HeaderParamSpec[];
   readonly idempotent?: boolean;
   readonly method: HttpMethod;
@@ -38,6 +41,7 @@ export type PublicApiRouteSpec = {
   readonly response?: string;
   readonly scope?: ApiKeyScope | "agent:bootstrap" | "dashboard_session";
   readonly successStatus?: SuccessStatus;
+  readonly successorPath?: string;
   readonly summary: string;
   readonly tags: readonly string[];
 };
@@ -190,6 +194,7 @@ export const publicApiRouteSpecs = [
     },
   ),
   route("GET", "/v1/projects", "listProjects", "Projects", "List projects", {
+    paginated: true,
     response: "ProjectList",
   }),
   route("POST", "/v1/projects", "createProject", "Projects", "Create a project", {
@@ -204,6 +209,7 @@ export const publicApiRouteSpecs = [
     scope: "usage:read",
   }),
   route("GET", "/v1/api-keys", "listApiKeys", "API Keys", "List API key metadata", {
+    paginated: true,
     response: "ApiKeyList",
     scope: "api_key:read",
   }),
@@ -230,6 +236,7 @@ export const publicApiRouteSpecs = [
     },
   ),
   route("GET", "/v1/sandboxes", "listSandboxes", "Sandboxes", "List sandboxes", {
+    paginated: true,
     response: "SandboxList",
     scope: "sandbox:read",
   }),
@@ -265,24 +272,46 @@ export const publicApiRouteSpecs = [
   ),
   route(
     "POST",
-    "/v1/sandboxes/{sandboxId}/extend",
-    "extendSandbox",
+    "/v1/sandboxes/{sandboxId}/ttl",
+    "setSandboxTtl",
     "Sandboxes",
-    "Extend sandbox TTL",
+    "Set sandbox TTL",
     {
+      description:
+        "Sets the sandbox TTL and resets the expiration countdown from the time of this request.",
       idempotent: true,
-      requestBody: "ExtendSandboxBody",
-      response: "ExtendSandboxResponse",
+      requestBody: "SetSandboxTtlBody",
+      response: "SetSandboxTtlResponse",
       scope: "sandbox:extend",
     },
   ),
   route(
     "POST",
-    "/v1/sandboxes/{sandboxId}/commands/run",
+    "/v1/sandboxes/{sandboxId}/extend",
+    "extendSandbox",
+    "Sandboxes",
+    "Extend sandbox TTL (deprecated)",
+    {
+      deprecated: true,
+      description:
+        "Deprecated alias for POST /v1/sandboxes/{sandboxId}/ttl. Sets the sandbox TTL and resets the expiration countdown from the time of this request.",
+      idempotent: true,
+      requestBody: "ExtendSandboxBody",
+      response: "ExtendSandboxResponse",
+      scope: "sandbox:extend",
+      successorPath: "/v1/sandboxes/{sandboxId}/ttl",
+    },
+  ),
+  route(
+    "POST",
+    "/v1/sandboxes/{sandboxId}/commands",
     "runCommand",
     "Commands",
-    "Run a command and wait",
+    "Run a command",
     {
+      additionalSuccessStatuses: ["202"],
+      description:
+        "Runs a command and waits by default. Set background=true to return immediately. collect and collectOn are only valid when background is false.",
       idempotent: true,
       requestBody: "RunCommandBody",
       response: "RunCommandResponse",
@@ -291,16 +320,37 @@ export const publicApiRouteSpecs = [
   ),
   route(
     "POST",
-    "/v1/sandboxes/{sandboxId}/commands/start",
-    "startCommand",
+    "/v1/sandboxes/{sandboxId}/commands/run",
+    "runCommandDeprecated",
     "Commands",
-    "Start a command",
+    "Run a command and wait (deprecated)",
     {
+      deprecated: true,
+      description:
+        "Deprecated foreground alias for POST /v1/sandboxes/{sandboxId}/commands.",
+      idempotent: true,
+      requestBody: "RunCommandBody",
+      response: "RunCommandResponse",
+      scope: "command:run",
+      successorPath: "/v1/sandboxes/{sandboxId}/commands",
+    },
+  ),
+  route(
+    "POST",
+    "/v1/sandboxes/{sandboxId}/commands/start",
+    "startCommandDeprecated",
+    "Commands",
+    "Start a command (deprecated)",
+    {
+      deprecated: true,
+      description:
+        "Deprecated background alias for POST /v1/sandboxes/{sandboxId}/commands. collect and collectOn are not valid.",
       idempotent: true,
       requestBody: "RunCommandBody",
       response: "RunCommandResponse",
       scope: "command:run",
       successStatus: "202",
+      successorPath: "/v1/sandboxes/{sandboxId}/commands",
     },
   ),
   route("GET", "/v1/commands/{commandId}", "getCommand", "Commands", "Get a command", {
@@ -375,6 +425,7 @@ export const publicApiRouteSpecs = [
     "Code",
     "List code contexts",
     {
+      paginated: true,
       response: "CodeContextList",
       scope: "code:run",
     },
@@ -541,6 +592,7 @@ export const publicApiRouteSpecs = [
     "Artifacts",
     "List artifacts",
     {
+      paginated: true,
       response: "ArtifactList",
       scope: "artifact:read",
     },
@@ -610,6 +662,7 @@ export const publicApiRouteSpecs = [
     "Previews",
     "List previews",
     {
+      paginated: true,
       response: "PreviewList",
       scope: "preview:read",
     },
@@ -650,6 +703,7 @@ export const publicApiRouteSpecs = [
     "Workspace Runs",
     "List Workspace Runs",
     {
+      paginated: true,
       response: "WorkspaceRunList",
       scope: "workspace_run:read",
     },
@@ -799,6 +853,8 @@ export const crownestOpenApiDocument = {
               code: { type: "string" },
               details: { additionalProperties: true, type: "object" },
               message: { type: "string" },
+              requestId: { type: "string" },
+              retryable: { type: "boolean" },
             },
             required: ["code", "message"],
             type: "object",
@@ -863,8 +919,8 @@ export const crownestOpenApiDocument = {
       DeletePreviewResponse: objectWith("preview", "Preview"),
       DownloadUrlResponse: objectSchema("Short-lived bearer-capability download URL."),
       EmptyObject: { additionalProperties: false, type: "object" },
-      ExtendSandboxBody: objectSchema("Sandbox TTL extension request."),
-      ExtendSandboxResponse: objectWith("sandbox", "Sandbox"),
+      ExtendSandboxBody: ref("SetSandboxTtlBody"),
+      ExtendSandboxResponse: ref("SetSandboxTtlResponse"),
       FileDownloadUrlBody: {
         properties: { path: { minLength: 1, type: "string" } },
         required: ["path"],
@@ -902,10 +958,33 @@ export const crownestOpenApiDocument = {
       RevokeApiKeyResponse: objectWith("apiKey", "ApiKey"),
       RunCodeBody: objectSchema("Code execution request."),
       RunCodeResponse: objectSchema("Code execution result."),
-      RunCommandBody: objectSchema("Command run request."),
+      RunCommandBody: {
+        additionalProperties: true,
+        description:
+          "Command request. collect and collectOn are only valid when background is false.",
+        properties: {
+          background: { default: false, type: "boolean" },
+          collect: { items: { type: "object" }, type: "array" },
+          collectOn: { type: "string" },
+          command: { minLength: 1, type: "string" },
+          cwd: { type: "string" },
+          env: { additionalProperties: { type: "string" }, type: "object" },
+          timeoutMs: { exclusiveMinimum: 0, type: "number" },
+        },
+        required: ["command"],
+        type: "object",
+      },
       RunCommandResponse: objectWith("command", "Command"),
       Sandbox: resourceSchema("sbx_"),
       SandboxList: paginationSchema("Sandbox"),
+      SetSandboxTtlBody: {
+        description:
+          "Sandbox TTL request. The countdown resets from the time of the request.",
+        properties: { ttlMs: { exclusiveMinimum: 0, type: "number" } },
+        required: ["ttlMs"],
+        type: "object",
+      },
+      SetSandboxTtlResponse: objectWith("sandbox", "Sandbox"),
       ServerSentEvents: { type: "string" },
       StatFileResponse: objectSchema("File stat result."),
       UsageSummaryResponse: objectSchema("Usage and quota summary."),
@@ -979,6 +1058,8 @@ function routeSpecsToPaths(specs: readonly PublicApiRouteSpec[]) {
 
 function operation(spec: PublicApiRouteSpec) {
   return {
+    ...(spec.deprecated === true ? { deprecated: true } : {}),
+    ...(spec.description === undefined ? {} : { description: spec.description }),
     operationId: spec.operationId,
     parameters: parameters(spec),
     responses: responses(spec),
@@ -1013,19 +1094,33 @@ function pathParameters(path: string) {
 }
 
 function responses(spec: PublicApiRouteSpec) {
-  const successStatus = spec.successStatus ?? "200";
+  const successStatuses = [
+    spec.successStatus ?? "200",
+    ...(spec.additionalSuccessStatuses ?? []),
+  ];
+  const successResponses = Object.fromEntries(
+    successStatuses.map((status) => [
+      status,
+      {
+        ...(spec.response === "NoContent"
+          ? {}
+          : { content: content(spec.response ?? "Object") }),
+        description: "Success.",
+        headers: responseHeaders(spec),
+      },
+    ]),
+  );
   return {
-    [successStatus]: {
-      ...(spec.response === "NoContent"
-        ? {}
-        : { content: content(spec.response ?? "Object") }),
-      description: "Success.",
-    },
-    "400": errorResponse("Invalid request."),
-    "401": errorResponse("Missing or invalid bearer credential."),
-    "403": errorResponse("Credential lacks the required scope or resource access."),
-    "404": errorResponse("Resource or route not found."),
-    "429": errorResponse("Rate limited or quota limited."),
+    ...successResponses,
+    "400": errorResponse("Invalid request.", spec),
+    "401": errorResponse("Missing or invalid bearer credential.", spec),
+    "403": errorResponse(
+      "Credential lacks the required scope or resource access.",
+      spec,
+    ),
+    "404": errorResponse("Resource or route not found.", spec),
+    "429": errorResponse("Rate limited or quota limited.", spec, true),
+    "503": errorResponse("Service temporarily unavailable.", spec, true),
   };
 }
 
@@ -1056,10 +1151,67 @@ function content(schemaName: string) {
   return { "application/json": { schema: ref(schemaName) } };
 }
 
-function errorResponse(description: string) {
+function errorResponse(
+  description: string,
+  spec: PublicApiRouteSpec,
+  retryAfter = false,
+) {
   return {
     content: { "application/json": { schema: ref("ApiErrorResponse") } },
     description,
+    headers: {
+      ...responseHeaders(spec),
+      ...(retryAfter
+        ? {
+            "Retry-After": {
+              description: "Seconds to wait before retrying the request.",
+              schema: { minimum: 0, type: "integer" },
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+function responseHeaders(spec: PublicApiRouteSpec) {
+  return {
+    ...standardResponseHeaders(),
+    ...(spec.deprecated === true
+      ? {
+          Deprecation: {
+            description: "Deprecation date as a Structured Field date value.",
+            schema: { example: "@1783641600", type: "string" },
+          },
+          Link: {
+            description: `Canonical successor endpoint: ${spec.successorPath ?? "the replacement route"}.`,
+            schema: { type: "string" },
+          },
+          Sunset: {
+            description: "Date after which the deprecated alias may be removed.",
+            schema: {
+              example: "Sat, 10 Jul 2027 23:59:59 GMT",
+              type: "string",
+            },
+          },
+        }
+      : {}),
+  };
+}
+
+function standardResponseHeaders() {
+  return {
+    "X-RateLimit-Limit": {
+      description: "Request limit for the current rate-limit window, when known.",
+      schema: { minimum: 0, type: "integer" },
+    },
+    "X-RateLimit-Remaining": {
+      description: "Requests remaining in the current rate-limit window, when known.",
+      schema: { minimum: 0, type: "integer" },
+    },
+    "x-request-id": {
+      description: "Correlation identifier for this request.",
+      schema: { type: "string" },
+    },
   };
 }
 

@@ -41,8 +41,9 @@
   },
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node18 --outfile=dist/index.js",
+    "lint": "eslint --max-warnings=0 .",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -50,7 +51,7 @@
   },
   "devDependencies": {
     "@crownest/sdk": "workspace:*",
-    "esbuild": "^0.28.0",
+    "esbuild": "catalog:",
     "tsx": "^4.21.0"
   }
 }

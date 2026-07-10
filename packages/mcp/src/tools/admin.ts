@@ -8,7 +8,13 @@ import {
   formatProjectList,
 } from "../formatting";
 import type { McpSession } from "../session";
-import { apiKeyIdSchema, handleTool } from "./shared";
+import {
+  apiKeyIdSchema,
+  handleTool,
+  paginationCursorSchema,
+  paginationInput,
+  paginationLimitSchema,
+} from "./shared";
 
 export function registerListApiKeys(server: McpServer, session: McpSession): void {
   server.registerTool(
@@ -16,9 +22,16 @@ export function registerListApiKeys(server: McpServer, session: McpSession): voi
     {
       description:
         "List CrowNest API Key metadata visible to the configured credential. Secret key values are never returned; this is for discovery and cleanup, not credential creation.",
-      inputSchema: z.object({}),
+      inputSchema: z.object({
+        cursor: paginationCursorSchema.optional(),
+        limit: paginationLimitSchema.optional(),
+      }),
     },
-    () => handleTool(async () => formatApiKeyList(await session.client.apiKeys.list())),
+    (input) =>
+      handleTool(async () => {
+        const page = await session.client.apiKeys.list(paginationInput(input));
+        return formatApiKeyList(page.data, page);
+      }),
   );
 }
 
@@ -83,9 +96,15 @@ export function registerListProjects(server: McpServer, session: McpSession): vo
     {
       description:
         "List CrowNest Projects visible to the configured credential. Use this as the read path for Project ids before creating Sandboxes, Workspace Runs, or API-key restrictions.",
-      inputSchema: z.object({}),
+      inputSchema: z.object({
+        cursor: paginationCursorSchema.optional(),
+        limit: paginationLimitSchema.optional(),
+      }),
     },
-    () =>
-      handleTool(async () => formatProjectList(await session.client.projects.list())),
+    (input) =>
+      handleTool(async () => {
+        const page = await session.client.projects.list(paginationInput(input));
+        return formatProjectList(page.data, page);
+      }),
   );
 }

@@ -27,6 +27,12 @@ const streamEventsJsonFlag = {
   description: "Print each streamed event as a JSON envelope.",
 } as const;
 
+const paginationFlags = [
+  { flag: "--limit", description: "Page size from 1 to 500." },
+  { flag: "--cursor", description: "Resume from an opaque pagination cursor." },
+  { flag: "--all", description: "Fetch every remaining page." },
+] as const;
+
 export const cliCommandHelp = {
   login: {
     summary: "Save API credentials or print login guidance.",
@@ -37,10 +43,21 @@ export const cliCommandHelp = {
       jsonFlag,
     ],
   },
+  usage: {
+    summary: "Print current credits, compute usage, and quota buckets.",
+    usage: "crownest usage [--json]",
+    flags: [jsonFlag],
+  },
+  whoami: {
+    summary:
+      "Verify the configured credential and report metadata or missing api_key:read scope.",
+    usage: "crownest whoami [--json]",
+    flags: [jsonFlag],
+  },
   "projects list": {
     summary: "List projects available to the configured API key.",
-    usage: "crownest projects list [--json]",
-    flags: [jsonFlag],
+    usage: "crownest projects list [--limit <n>] [--cursor <cursor>] [--all] [--json]",
+    flags: [...paginationFlags, jsonFlag],
   },
   "keys create": {
     summary: "Create an API key from a human dashboard session.",
@@ -56,9 +73,11 @@ export const cliCommandHelp = {
   },
   "keys list": {
     summary: "List API keys from a human dashboard session.",
-    usage: "crownest keys list [--api-url <url>] [--json]",
+    usage:
+      "crownest keys list [--api-url <url>] [--limit <n>] [--cursor <cursor>] [--all] [--json]",
     flags: [
       { flag: "--api-url", description: "API base URL for key management." },
+      ...paginationFlags,
       jsonFlag,
     ],
   },
@@ -72,9 +91,9 @@ export const cliCommandHelp = {
       jsonFlag,
     ],
   },
-  "sandboxes extend": {
-    summary: "Reset a live sandbox TTL from now.",
-    usage: "crownest sandboxes extend <sandbox-id> --ttl-ms <ms> [--json]",
+  "sandboxes set-ttl": {
+    summary: "Reset the sandbox TTL countdown from now.",
+    usage: "crownest sandboxes set-ttl <sandbox-id> --ttl-ms <ms> [--json]",
     flags: [
       { flag: "--ttl-ms", description: "New sandbox lifetime in milliseconds." },
       jsonFlag,
@@ -82,7 +101,12 @@ export const cliCommandHelp = {
   },
   "sandboxes list": {
     summary: "List live sandboxes.",
-    usage: "crownest sandboxes list [--json]",
+    usage: "crownest sandboxes list [--limit <n>] [--cursor <cursor>] [--all] [--json]",
+    flags: [...paginationFlags, jsonFlag],
+  },
+  "sandboxes get": {
+    summary: "Print one sandbox.",
+    usage: "crownest sandboxes get <sandbox-id> [--json]",
     flags: [jsonFlag],
   },
   "sandboxes kill": {
@@ -91,10 +115,15 @@ export const cliCommandHelp = {
     flags: [jsonFlag],
   },
   "commands run": {
-    summary: "Run a command and wait for it to finish.",
+    summary: "Run a command in the foreground or start it in the background.",
     usage:
-      "crownest commands run <sandbox-id> [--collect <path>]... [--collect-on success|always] [--json] -- <command>",
+      "crownest commands run <sandbox-id> [--background] [--collect <path>]... [--collect-on success|always] [--json] -- <command>",
     flags: [
+      {
+        flag: "--background",
+        description:
+          "Return immediately; incompatible with --collect and --collect-on.",
+      },
       {
         flag: "--collect",
         description: "Workspace path to export as an artifact. Repeatable.",
@@ -103,9 +132,9 @@ export const cliCommandHelp = {
       jsonFlag,
     ],
   },
-  "commands start": {
-    summary: "Start a command without waiting for completion.",
-    usage: "crownest commands start <sandbox-id> [--json] -- <command>",
+  "commands get": {
+    summary: "Print one command and its captured output.",
+    usage: "crownest commands get <command-id> [--json]",
     flags: [jsonFlag],
   },
   "commands cancel": {
@@ -192,8 +221,9 @@ export const cliCommandHelp = {
   "files write": {
     summary: "Write content to a workspace file.",
     usage:
-      "crownest files write <sandbox-id> <path> <content> [--create-parents] [--json]",
+      "crownest files write <sandbox-id> <path> (<content> | - | --file <local-path>) [--create-parents] [--json]",
     flags: [
+      { flag: "--file", description: "Read content from a local text file." },
       { flag: "--create-parents", description: "Create missing parent directories." },
       jsonFlag,
     ],
@@ -205,6 +235,18 @@ export const cliCommandHelp = {
     flags: [
       { flag: "--to", description: "Destination workspace path." },
       { flag: "--create-parents", description: "Create missing parent directories." },
+      jsonFlag,
+    ],
+  },
+  "files download": {
+    summary: "Download a workspace file with binary-safe transfer.",
+    usage:
+      "crownest files download <sandbox-id> <remote-path> [<local-path> | --output <path>] [--json]",
+    flags: [
+      {
+        flag: "--output",
+        description: "Local output path; defaults to remote basename.",
+      },
       jsonFlag,
     ],
   },
@@ -246,8 +288,9 @@ export const cliCommandHelp = {
   },
   "artifacts list": {
     summary: "List artifacts exported from a sandbox.",
-    usage: "crownest artifacts list <sandbox-id> [--json]",
-    flags: [jsonFlag],
+    usage:
+      "crownest artifacts list <sandbox-id> [--limit <n>] [--cursor <cursor>] [--all] [--json]",
+    flags: [...paginationFlags, jsonFlag],
   },
   "artifacts download": {
     summary: "Download an artifact to a local file.",
@@ -262,17 +305,21 @@ export const cliCommandHelp = {
   "previews create": {
     summary: "Expose a sandbox port as an authenticated preview.",
     usage:
-      "crownest previews create <sandbox-id> --port <port> [--auth authenticated|token] [--json]",
+      "crownest previews create <sandbox-id> --port <port> [--auth-mode authenticated|token] [--json]",
     flags: [
       { flag: "--port", description: "Sandbox port from 1 to 65535." },
-      { flag: "--auth", description: "Preview auth mode: authenticated or token." },
+      {
+        flag: "--auth-mode",
+        description: "Preview auth mode: authenticated or token. Alias: --auth.",
+      },
       jsonFlag,
     ],
   },
   "previews list": {
     summary: "List previews for a sandbox.",
-    usage: "crownest previews list <sandbox-id> [--json]",
-    flags: [jsonFlag],
+    usage:
+      "crownest previews list <sandbox-id> [--limit <n>] [--cursor <cursor>] [--all] [--json]",
+    flags: [...paginationFlags, jsonFlag],
   },
   "previews revoke": {
     summary: "Revoke a preview.",
@@ -327,10 +374,11 @@ export const cliCommandHelp = {
   "workspace-runs list": {
     summary: "List Workspace Runs.",
     usage:
-      "crownest workspace-runs list [--project <prj_id>] [--status <status>] [--json]",
+      "crownest workspace-runs list [--project <prj_id>] [--status <status>] [--limit <n>] [--cursor <cursor>] [--all] [--json]",
     flags: [
       { flag: "--project", description: "Filter by project." },
       { flag: "--status", description: "Filter by Workspace Run status." },
+      ...paginationFlags,
       jsonFlag,
     ],
   },
@@ -429,6 +477,9 @@ function exitCodeHelp(): readonly string[] {
     `  ${CLI_EXIT_OK}  success`,
     `  ${CLI_EXIT_API_ERROR}  API or runtime error`,
     `  ${CLI_EXIT_USAGE_ERROR}  usage error (invalid command, flags, or arguments)`,
+    "  foreground commands run returns the sandbox command exit code (maximum 125)",
+    "  background commands run exits 0 after a successful start",
+    "  sandbox exit codes 1 and 2 overlap CLI errors; --json distinguishes result envelopes",
   ];
 }
 

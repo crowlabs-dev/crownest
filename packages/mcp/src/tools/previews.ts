@@ -3,7 +3,14 @@ import { z } from "zod/v4";
 
 import { formatPreview, formatPreviewCreate, formatPreviewList } from "../formatting";
 import type { McpSession } from "../session";
-import { handleTool, previewIdSchema, sandboxIdSchema } from "./shared";
+import {
+  handleTool,
+  paginationCursorSchema,
+  paginationInput,
+  paginationLimitSchema,
+  previewIdSchema,
+  sandboxIdSchema,
+} from "./shared";
 
 export function registerCreatePreview(server: McpServer, session: McpSession): void {
   server.registerTool(
@@ -38,6 +45,8 @@ export function registerListPreviews(server: McpServer, session: McpSession): vo
       description:
         "List CrowNest Previews for a Sandbox. Pass sandbox_id or omit sandbox_id to lazily create or reuse the current default Sandbox.",
       inputSchema: z.object({
+        cursor: paginationCursorSchema.optional(),
+        limit: paginationLimitSchema.optional(),
         sandbox_id: sandboxIdSchema.optional(),
       }),
     },
@@ -46,7 +55,8 @@ export function registerListPreviews(server: McpServer, session: McpSession): vo
         const sandbox = await session.resolveSandbox(
           input.sandbox_id as `sbx_${string}` | undefined,
         );
-        return formatPreviewList(sandbox.id, await sandbox.previews.list());
+        const page = await sandbox.previews.list(paginationInput(input));
+        return formatPreviewList(sandbox.id, page.data, page);
       }),
   );
 }

@@ -15,6 +15,7 @@ describe("toolError", () => {
         details: null,
         message: "Bad input.",
         remediation: null,
+        requestId: null,
         retryable: false,
         status: null,
       },
@@ -36,8 +37,29 @@ describe("toolError", () => {
         details: { retryAfterMs: 1000 },
         message: "Too many requests.",
         remediation: null,
+        requestId: null,
         retryable: true,
         status: 429,
+      },
+    });
+  });
+
+  it("preserves API request ids and explicit retryability", () => {
+    const error = new CrowNestApiError(503, {
+      code: "service_unavailable",
+      message: "Try again later.",
+      retryable: false,
+    });
+    Object.defineProperty(error, "requestId", { value: "req_123" });
+
+    const result = toolError(error);
+
+    expect(JSON.parse(text(result))).toMatchObject({
+      error: {
+        code: "service_unavailable",
+        requestId: "req_123",
+        retryable: false,
+        status: 503,
       },
     });
   });

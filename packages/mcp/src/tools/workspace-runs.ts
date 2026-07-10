@@ -3,9 +3,13 @@ import { z } from "zod/v4";
 
 import { jsonTextResult } from "../formatting";
 import type { McpSession } from "../session";
+import { transferPayload } from "../workspace-run-formatting";
 import {
   handleTool,
   idempotencyKeySchema,
+  paginationCursorSchema,
+  paginationInput,
+  paginationLimitSchema,
   projectIdSchema,
   sandboxIdSchema,
   sha256Schema,
@@ -295,23 +299,29 @@ export function registerListWorkspaceRuns(
       description:
         "List Workspace Runs visible to the configured API Key. Filter by project_id, status, and exact metadata labels to find previous agent runs.",
       inputSchema: z.object({
+        cursor: paginationCursorSchema.optional(),
+        limit: paginationLimitSchema.optional(),
         metadata: metadataSchema.optional(),
         project_id: projectIdSchema.optional(),
         status: workspaceRunStatusSchema.optional(),
       }),
     },
     (input) =>
-      handleTool(async () =>
-        jsonTextResult({
-          data: await session.client.workspaceRuns.list({
-            ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
-            ...(input.project_id === undefined
-              ? {}
-              : { projectId: input.project_id as `prj_${string}` }),
-            ...(input.status === undefined ? {} : { status: input.status }),
-          }),
-        }),
-      ),
+      handleTool(async () => {
+        const page = await session.client.workspaceRuns.list({
+          ...paginationInput(input),
+          ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
+          ...(input.project_id === undefined
+            ? {}
+            : { projectId: input.project_id as `prj_${string}` }),
+          ...(input.status === undefined ? {} : { status: input.status }),
+        });
+        return jsonTextResult({
+          data: page.data,
+          has_more: page.hasMore,
+          next_cursor: page.nextCursor ?? null,
+        });
+      }),
   );
 }
 
@@ -389,28 +399,4 @@ export function registerGetWorkspaceRunEvidence(
         ),
       ),
   );
-}
-
-function transferPayload(transfer: {
-  readonly checksumAlgorithm: string;
-  readonly expiresAt: string;
-  readonly headers: Readonly<Record<string, string>>;
-  readonly id: `upl_${string}`;
-  readonly maxSizeBytes: number;
-  readonly method: string;
-  readonly status: string;
-  readonly uploadUrl: string;
-  readonly workspaceRunId: `wsr_${string}`;
-}): Record<string, unknown> {
-  return {
-    checksum_algorithm: transfer.checksumAlgorithm,
-    expires_at: transfer.expiresAt,
-    header_names: Object.keys(transfer.headers),
-    max_size_bytes: transfer.maxSizeBytes,
-    method: transfer.method,
-    status: transfer.status,
-    upload_id: transfer.id,
-    upload_url: transfer.uploadUrl,
-    workspace_run_id: transfer.workspaceRunId,
-  };
 }

@@ -28,14 +28,17 @@ function registerProjectClientTests() {
       fetch: fetchMock,
     });
 
-    await expect(client.projects.list()).resolves.toEqual([
-      {
-        createdAt: "2026-06-09T15:30:00.000Z",
-        id: "prj_123",
-        name: "Default Project",
-        orgId: "org_123",
-      },
-    ]);
+    await expect(client.projects.list()).resolves.toEqual({
+      data: [
+        {
+          createdAt: "2026-06-09T15:30:00.000Z",
+          id: "prj_123",
+          name: "Default Project",
+          orgId: "org_123",
+        },
+      ],
+      hasMore: false,
+    });
     expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.test/v1/projects");
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("GET");
   });
@@ -70,8 +73,8 @@ function registerIdempotencyTests() {
       idempotencyKey: "create-key",
       projectId: "prj_123",
     });
-    await client.sandboxes.extend("sbx_123", {
-      idempotencyKey: "extend-key",
+    await client.sandboxes.setTtl("sbx_123", {
+      idempotencyKey: "set-ttl-key",
       ttlMs: 5_400_000,
     });
     await client.commands.run("sbx_123", "python main.py", {
@@ -86,7 +89,7 @@ function registerIdempotencyTests() {
     expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(
       JSON.stringify({ projectId: "prj_123" }),
     );
-    expect(idempotencyHeader(fetchMock, 1)).toBe("extend-key");
+    expect(idempotencyHeader(fetchMock, 1)).toBe("set-ttl-key");
     expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(
       JSON.stringify({ ttlMs: 5_400_000 }),
     );

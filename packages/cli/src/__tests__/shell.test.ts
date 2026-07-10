@@ -20,7 +20,7 @@ function registerCodeShellTests() {
       .mockResolvedValueOnce(jsonResponse({ context: codeContext("python") }))
       .mockResolvedValueOnce(sseResponse(completeEvent({ executionCount: 1 })))
       .mockResolvedValueOnce(
-        sseResponse(completeEvent({ executionCount: 2, stdout: ["42\n"] })),
+        sseResponse(completeEvent({ executionCount: 2, stdout: "42\n" })),
       )
       .mockResolvedValueOnce(jsonResponse({ context: codeContext("python") }));
 
@@ -68,7 +68,7 @@ function registerCodeShellTests() {
         ),
       )
       .mockResolvedValueOnce(
-        sseResponse(completeEvent({ executionCount: 2, stdout: ["ok\n"] })),
+        sseResponse(completeEvent({ executionCount: 2, stdout: "ok\n" })),
       )
       .mockResolvedValueOnce(jsonResponse({ context: codeContext("python") }));
 
@@ -158,8 +158,8 @@ function registerBashShellTests() {
     expect(result.stdout).toContain("ok\n");
     expect(result.stderr).toBe("bad\n[exit 2]\n");
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "https://api.test/v1/sandboxes/sbx_123/commands/run",
-      "https://api.test/v1/sandboxes/sbx_123/commands/run",
+      "https://api.test/v1/sandboxes/sbx_123/commands",
+      "https://api.test/v1/sandboxes/sbx_123/commands",
     ]);
     expect(requestBody(fetchMock, 0)).toEqual({ command: "false" });
     expect(requestBody(fetchMock, 1)).toEqual({ command: "echo ok" });
@@ -215,8 +215,8 @@ function completeEvent(
   data: Partial<{
     readonly error: unknown;
     readonly executionCount: number;
-    readonly stderr: readonly string[];
-    readonly stdout: readonly string[];
+    readonly stderr: string;
+    readonly stdout: string;
   }>,
 ) {
   return sseEvent("complete", {
@@ -226,8 +226,8 @@ function completeEvent(
       language: "python",
       outputs: [],
       sandboxId: "sbx_123",
-      stderr: [],
-      stdout: [],
+      stderr: "",
+      stdout: "",
       ...data,
     },
     type: "complete",

@@ -8,7 +8,14 @@ import {
   jsonTextResult,
 } from "../formatting";
 import type { McpSession } from "../session";
-import { artifactIdSchema, handleTool, sandboxIdSchema } from "./shared";
+import {
+  artifactIdSchema,
+  handleTool,
+  paginationCursorSchema,
+  paginationInput,
+  paginationLimitSchema,
+  sandboxIdSchema,
+} from "./shared";
 
 export function registerDownloadArtifact(server: McpServer, session: McpSession): void {
   server.registerTool(
@@ -87,6 +94,8 @@ export function registerListArtifacts(server: McpServer, session: McpSession): v
       description:
         "List durable CrowNest Artifacts created from a Sandbox Workspace. Pass sandbox_id or omit sandbox_id to lazily create or reuse the current default Sandbox.",
       inputSchema: z.object({
+        cursor: paginationCursorSchema.optional(),
+        limit: paginationLimitSchema.optional(),
         sandbox_id: sandboxIdSchema.optional(),
       }),
     },
@@ -95,7 +104,8 @@ export function registerListArtifacts(server: McpServer, session: McpSession): v
         const sandbox = await session.resolveSandbox(
           input.sandbox_id as `sbx_${string}` | undefined,
         );
-        return formatArtifactList(sandbox.id, await sandbox.artifacts.list());
+        const page = await sandbox.artifacts.list(paginationInput(input));
+        return formatArtifactList(sandbox.id, page.data, page);
       }),
   );
 }

@@ -159,8 +159,8 @@ function formatCodeRun(result: CodeRunResult): string {
     `language: ${result.language}`,
     `execution_count: ${result.executionCount}`,
     ...(result.durationMs === undefined ? [] : [`duration_ms: ${result.durationMs}`]),
-    `stdout:\n${joinChunks(result.stdout)}`,
-    `stderr:\n${joinChunks(result.stderr)}`,
+    `stdout:\n${result.stdout}`,
+    `stderr:\n${result.stderr}`,
     ...formatOutputs(result.outputs),
   ];
 
@@ -236,10 +236,6 @@ function formatFileStat(sandboxId: `sbx_${string}`, file: FileStat): string {
     `type: ${file.type}`,
     `size_bytes: ${file.sizeBytes}`,
   ].join("\n");
-}
-
-function joinChunks(chunks: readonly string[]): string {
-  return chunks.join("");
 }
 
 function boundUtf8(value: string, maxBytes: number) {

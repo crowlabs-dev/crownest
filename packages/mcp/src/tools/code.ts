@@ -3,7 +3,14 @@ import { z } from "zod/v4";
 
 import { formatCodeContext, formatCodeContextList, formatCodeRun } from "../formatting";
 import type { McpSession } from "../session";
-import { codeContextIdSchema, handleTool, sandboxIdSchema } from "./shared";
+import {
+  codeContextIdSchema,
+  handleTool,
+  paginationCursorSchema,
+  paginationInput,
+  paginationLimitSchema,
+  sandboxIdSchema,
+} from "./shared";
 
 export function registerRunCode(server: McpServer, session: McpSession): void {
   server.registerTool(
@@ -71,6 +78,8 @@ export function registerListCodeContexts(server: McpServer, session: McpSession)
       description:
         "List live CrowNest Code Contexts in a Sandbox. Pass sandbox_id or omit sandbox_id to lazily create or reuse the current default Sandbox; Code Contexts hold persisted variables/imports for run_code.",
       inputSchema: z.object({
+        cursor: paginationCursorSchema.optional(),
+        limit: paginationLimitSchema.optional(),
         sandbox_id: sandboxIdSchema.optional(),
       }),
     },
@@ -79,7 +88,8 @@ export function registerListCodeContexts(server: McpServer, session: McpSession)
         const sandbox = await session.resolveSandbox(
           input.sandbox_id as `sbx_${string}` | undefined,
         );
-        return formatCodeContextList(sandbox.id, await sandbox.code.listContexts());
+        const page = await sandbox.code.listContexts(paginationInput(input));
+        return formatCodeContextList(sandbox.id, page.data, page);
       }),
   );
 }

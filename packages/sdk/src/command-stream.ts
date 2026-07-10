@@ -5,6 +5,7 @@ import type {
   ListCommandLogsResponse,
 } from "@crownest/contracts";
 
+import type { CommandStreamInput } from "./client-types";
 import {
   commandLogParams,
   CrowNestApiError,
@@ -16,11 +17,6 @@ import {
   runSandboxCommand,
   type Transport,
 } from "./protocol";
-
-export type CommandLogStreamOptions = {
-  readonly afterSeq?: number;
-  readonly reconnect?: boolean;
-};
 
 const terminalCommandStatuses = new Set<Command["status"]>([
   "exited",
@@ -37,39 +33,37 @@ export async function runCommandWithCallbacks(
   transport: Transport,
   sandboxId: `sbx_${string}`,
   command: string,
-  mode: "run" | "start",
   input: RunCommandOptions,
 ): Promise<Command> {
   if (!hasCommandLogCallbacks(input)) {
-    return runSandboxCommand(transport, sandboxId, command, mode, input);
+    return runSandboxCommand(transport, sandboxId, command, input);
   }
 
-  if (mode === "run" && hasCommandCollection(input)) {
+  if (input.background !== true && hasCommandCollection(input)) {
     const terminalCommand = await runSandboxCommand(
       transport,
       sandboxId,
       command,
-      "run",
-      withCallbackRunReadRequirement(mode, input),
+      withCallbackRunReadRequirement(input),
     );
     await replayCommandLogs(transport, terminalCommand.id, input);
     return terminalCommand;
   }
 
-  const startInput = withCallbackRunReadRequirement(
-    mode,
-    withCallbackRunTimeout(mode, input),
+  const requestedBackground = input.background === true;
+  const backgroundInput = backgroundCommandInput(
+    withCallbackRunTimeout(input),
+    !requestedBackground,
   );
   const commandResponse = await runSandboxCommand(
     transport,
     sandboxId,
     command,
-    "start",
-    startInput,
+    backgroundInput,
   );
   const pump = startCommandStreamPump(transport, commandResponse.id, input);
 
-  if (mode === "start") {
+  if (requestedBackground) {
     return commandResponse;
   }
 
@@ -87,37 +81,47 @@ export async function runCommandWithCallbacks(
   }
 }
 
-type CallbackRunStartOptions = RunCommandOptions & {
+type CallbackCommandOptions = RunCommandOptions & {
   readonly _crownestRequireCommandRead?: true;
 };
 
 function withCallbackRunReadRequirement(
-  mode: "run" | "start",
   input: RunCommandOptions,
-): CallbackRunStartOptions {
-  if (mode === "start") {
-    return input;
-  }
+): CallbackCommandOptions {
   return { ...input, _crownestRequireCommandRead: true };
 }
 
-function withCallbackRunTimeout(
-  mode: "run" | "start",
-  input: RunCommandOptions,
-): RunCommandOptions {
-  if (mode === "start" || input.timeoutMs !== undefined) {
+function withCallbackRunTimeout(input: RunCommandOptions): RunCommandOptions {
+  if (input.background === true || input.timeoutMs !== undefined) {
     return input;
   }
   return { ...input, timeoutMs: defaultBlockingCommandTimeoutMs };
 }
 
+function backgroundCommandInput(
+  input: RunCommandOptions,
+  requireCommandRead: boolean,
+): CallbackCommandOptions {
+  const {
+    background: _background,
+    collect: _collect,
+    collectOn: _collectOn,
+    ...common
+  } = input;
+  return {
+    ...common,
+    background: true,
+    ...(requireCommandRead ? { _crownestRequireCommandRead: true } : {}),
+  };
+}
+
 export async function* streamCommandLogs(
   transport: Transport,
   commandId: `cmd_${string}`,
-  input: CommandLogStreamOptions = {},
+  input: CommandStreamInput = {},
 ): AsyncIterable<CommandLogStreamEvent> {
   if (input.reconnect === false) {
-    yield* streamCommandLogsOnce(transport, commandId, input.afterSeq);
+    yield* streamCommandLogsOnce(transport, commandId, input);
     return;
   }
 
@@ -128,7 +132,12 @@ export async function* streamCommandLogs(
   for (;;) {
     let madeLogProgress = false;
     try {
-      for await (const event of streamCommandLogsOnce(transport, commandId, afterSeq)) {
+      const nextInput = commandStreamInput(input, afterSeq);
+      for await (const event of streamCommandLogsOnce(
+        transport,
+        commandId,
+        nextInput,
+      )) {
         if (event.type === "log") {
           madeLogProgress = commandLogMadeProgress(event.seq, afterSeq);
           afterSeq = event.seq;
@@ -140,7 +149,7 @@ export async function* streamCommandLogs(
       }
       originalError ??= new Error("Command log stream ended before a terminal event.");
     } catch (error) {
-      throwIfStructuredApiError(error);
+      throwIfNonReconnectableStreamError(error, input.signal);
       originalError ??= error;
     }
 
@@ -155,8 +164,26 @@ export async function* streamCommandLogs(
   }
 }
 
-function throwIfStructuredApiError(error: unknown): void {
-  if (error instanceof CrowNestApiError) {
+function commandStreamInput(
+  input: CommandStreamInput,
+  afterSeq: number | undefined,
+): CommandStreamInput {
+  return afterSeq === undefined ? input : { ...input, afterSeq };
+}
+
+function throwIfNonReconnectableStreamError(
+  error: unknown,
+  signal: AbortSignal | undefined,
+): void {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException("The operation was aborted.", "AbortError");
+  }
+  if (
+    error instanceof CrowNestApiError ||
+    (error instanceof Error && error.name === "TimeoutError")
+  ) {
     throw error;
   }
 }
@@ -176,12 +203,19 @@ function isTerminalStreamEvent(event: CommandLogStreamEvent): boolean {
 function streamCommandLogsOnce(
   transport: Transport,
   commandId: `cmd_${string}`,
-  afterSeq: number | undefined,
+  input: CommandStreamInput,
 ): AsyncIterable<CommandLogStreamEvent> {
   return transport.streamSse<CommandLogStreamEvent>(
     `/v1/commands/${commandId}/stream${queryString(
-      commandLogParams(afterSeq === undefined ? {} : { afterSeq }),
+      commandLogParams(
+        input.afterSeq === undefined ? {} : { afterSeq: input.afterSeq },
+      ),
     )}`,
+    {
+      signal: input.signal,
+      streamIdleTimeoutMs: input.streamIdleTimeoutMs,
+      timeoutMs: input.timeoutMs,
+    },
   );
 }
 

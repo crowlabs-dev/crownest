@@ -19,26 +19,29 @@ describe("run_command", () => {
       timeoutMs: 500,
     });
     expect(text(result)).toContain("command_id: cmd_123");
+    expect(text(result)).toContain("status: exited");
     expect(text(result)).toContain("exit_code: 0");
     expect(text(result)).toContain("stdout:\n");
     expect(text(result)).toContain("stderr:\n");
   });
 
-  it("starts Commands without waiting for completion", async () => {
+  it("runs Commands in the background without waiting for completion", async () => {
     const sandbox = createSandboxHandle("sbx_command");
-    sandbox.mocks.commandStart.mockResolvedValueOnce({
+    sandbox.mocks.commandRun.mockResolvedValueOnce({
       ...commandResult("sbx_command"),
       status: "running",
     });
     const { tools } = createHarness([sandbox]);
 
-    const result = await callTool(tools, "start_command", {
+    const result = await callTool(tools, "run_command", {
+      background: true,
       command: "pnpm test",
       cwd: "/workspace/app",
       timeout_ms: 500,
     });
 
-    expect(sandbox.mocks.commandStart).toHaveBeenCalledWith("pnpm test", {
+    expect(sandbox.mocks.commandRun).toHaveBeenCalledWith("pnpm test", {
+      background: true,
       cwd: "/workspace/app",
       timeoutMs: 500,
     });
@@ -52,7 +55,10 @@ describe("Workspace read/write tools", () => {
     const sandbox = createSandboxHandle("sbx_files");
     sandbox.mocks.fileWrite.mockResolvedValueOnce(fileStat());
     sandbox.mocks.fileRead.mockResolvedValueOnce("hello");
-    sandbox.mocks.fileList.mockResolvedValueOnce([fileEntry()]);
+    sandbox.mocks.fileList.mockResolvedValueOnce({
+      data: [fileEntry()],
+      hasMore: false,
+    });
     const { tools } = createHarness([sandbox]);
 
     await callTool(tools, "write_file", fileInput());
@@ -116,10 +122,10 @@ describe("Command inspection tools", () => {
       ...commandResult("sbx_default"),
       status: "exited",
     });
-    client.mocks.readCommandLogs.mockResolvedValueOnce([
-      commandLog("stdout", "one\ntwo\n"),
-      commandLog("stderr", "three\n"),
-    ]);
+    client.mocks.readCommandLogs.mockResolvedValueOnce({
+      data: [commandLog("stdout", "one\ntwo\n"), commandLog("stderr", "three\n")],
+      hasMore: false,
+    });
 
     const command = await callTool(tools, "get_command", {
       command_id: "cmd_123",
@@ -149,7 +155,10 @@ describe("Command inspection tools", () => {
 
   it("uses an API-safe default Command log replay limit", async () => {
     const { client, tools } = createHarness([createSandboxHandle("sbx_default")]);
-    client.mocks.readCommandLogs.mockResolvedValueOnce([]);
+    client.mocks.readCommandLogs.mockResolvedValueOnce({
+      data: [],
+      hasMore: false,
+    });
 
     const logs = await callTool(tools, "stream_command_logs", {
       command_id: "cmd_123",

@@ -160,8 +160,8 @@ export function registerListFiles(server: McpServer, session: McpSession): void 
         const sandbox = await session.resolveSandbox(
           input.sandbox_id as `sbx_${string}` | undefined,
         );
-        const files = await sandbox.files.list(input.path);
-        return formatFiles(sandbox.id, files);
+        const filesPage = await sandbox.files.list(input.path);
+        return formatFiles(sandbox.id, filesPage.data);
       }),
   );
 }

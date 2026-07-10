@@ -9,7 +9,7 @@ import { runCli } from "../index";
 
 describe("runCli", () => {
   registerSandboxCliTests();
-  registerSandboxExtendCliTests();
+  registerSandboxSetTtlCliTests();
   registerCommandCliTests();
   registerCommandCollectCliTests();
   registerCodeCliTests();
@@ -59,8 +59,8 @@ function registerSandboxCliTests() {
   });
 }
 
-function registerSandboxExtendCliTests() {
-  it("extends a sandbox through the SDK transport", async () => {
+function registerSandboxSetTtlCliTests() {
+  it("resets a sandbox TTL through the canonical endpoint", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
       jsonResponse({
         sandbox: {
@@ -79,7 +79,7 @@ function registerSandboxExtendCliTests() {
       }),
     );
     const result = await runCli(
-      ["sandboxes", "extend", "sbx_123", "--ttl-ms", "5400000"],
+      ["sandboxes", "set-ttl", "sbx_123", "--ttl-ms", "5400000"],
       {
         CROWNEST_API_KEY: "cn_live_test",
         CROWNEST_API_URL: "https://api.test",
@@ -91,7 +91,7 @@ function registerSandboxExtendCliTests() {
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("expiresAt: 2026-06-09T16:00:00.000Z");
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://api.test/v1/sandboxes/sbx_123/extend",
+      "https://api.test/v1/sandboxes/sbx_123/ttl",
       expect.objectContaining({
         body: JSON.stringify({ ttlMs: 5_400_000 }),
         method: "POST",
@@ -99,10 +99,10 @@ function registerSandboxExtendCliTests() {
     );
   });
 
-  it("rejects invalid sandbox extension TTL before making a request", async () => {
+  it("rejects invalid sandbox TTL before making a request", async () => {
     const fetchMock = vi.fn<typeof fetch>();
     const result = await runCli(
-      ["sandboxes", "extend", "sbx_123", "--ttl-ms", "0"],
+      ["sandboxes", "set-ttl", "sbx_123", "--ttl-ms", "0"],
       {
         CROWNEST_API_KEY: "cn_live_test",
         CROWNEST_API_URL: "https://api.test",
@@ -618,7 +618,7 @@ function registerCommandCliTests() {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      "https://api.test/v1/sandboxes/sbx_123/commands/run",
+      "https://api.test/v1/sandboxes/sbx_123/commands",
     );
     const commandRequest = fetchMock.mock.calls[0]?.[1];
     expect(commandRequest?.body).toBe(
@@ -1017,7 +1017,7 @@ function registerCommandCollectCliTests() {
     );
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      "https://api.test/v1/sandboxes/sbx_123/commands/run",
+      "https://api.test/v1/sandboxes/sbx_123/commands",
     );
     expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(
       JSON.stringify({
@@ -1142,7 +1142,7 @@ function registerUsageAndOutputTests() {
   it("renders usage failures as JSON errors in JSON mode", async () => {
     const fetchMock = vi.fn<typeof fetch>();
     const result = await runCli(
-      ["sandboxes", "extend", "sbx_123", "--ttl-ms", "0", "--json"],
+      ["sandboxes", "set-ttl", "sbx_123", "--ttl-ms", "0", "--json"],
       {
         CROWNEST_API_KEY: "cn_live_test",
         CROWNEST_API_URL: "https://api.test",
@@ -1212,8 +1212,8 @@ function registerUsageAndOutputTests() {
       readonly command: string;
     }[] = [
       {
-        argv: ["sandboxes", "extend", "sbx_123", "--ttl-ms", "1000", "extra"],
-        command: "sandboxes extend",
+        argv: ["sandboxes", "set-ttl", "sbx_123", "--ttl-ms", "1000", "extra"],
+        command: "sandboxes set-ttl",
       },
       { argv: ["sandboxes", "kill", "sbx_123", "extra"], command: "sandboxes kill" },
       { argv: ["commands", "cancel", "cmd_123", "extra"], command: "commands cancel" },
@@ -1282,7 +1282,7 @@ function registerUsageAndOutputTests() {
     };
     const commandCases: readonly (readonly string[])[] = [
       ["commands", "run", "--bogus", "--", "echo", "hi"],
-      ["commands", "start", "--json", "--", "echo", "hi"],
+      ["commands", "run", "--json", "--", "echo", "hi"],
     ];
 
     for (const argv of commandCases) {
@@ -1302,7 +1302,7 @@ function registerUsageAndOutputTests() {
     };
     const commandCases: readonly (readonly string[])[] = [
       ["commands", "run", "sbx_123", "--templte", "python"],
-      ["commands", "start", "sbx_123", "--json", "echo", "hi"],
+      ["commands", "run", "sbx_123", "--json", "echo", "hi"],
     ];
 
     for (const argv of commandCases) {

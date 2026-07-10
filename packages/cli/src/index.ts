@@ -12,15 +12,27 @@ import {
   CrowNestApiError,
   type CrowNestClient,
   type CrowNestClientOptions,
-  type RunCommandOptions,
 } from "@crownest/sdk";
 
 import packageJson from "../package.json";
+import {
+  apiGet,
+  apiPost,
+  authenticatedFetch,
+  configuredCredential,
+  throwApiResponse,
+} from "./api-request";
 import { codeRunCommand } from "./code-commands";
 import { loadCredentialConfig } from "./credential-config";
-import { CLI_EXIT_API_ERROR, CLI_EXIT_OK, CLI_EXIT_USAGE_ERROR } from "./exit-codes";
+import {
+  CLI_EXIT_API_ERROR,
+  CLI_EXIT_OK,
+  CLI_EXIT_USAGE_ERROR,
+  sandboxCommandExitCode,
+} from "./exit-codes";
 import {
   deleteFileCommand,
+  downloadFileCommand,
   listFilesCommand,
   mkdirCommand,
   moveFileCommand,
@@ -46,7 +58,20 @@ import {
   listApiKeysCommand,
   loginCommand,
 } from "./human-commands";
-import { jsonEnvelope, jsonErrorEnvelope, renderList, renderRecord } from "./output";
+import {
+  jsonEnvelope,
+  jsonErrorEnvelope,
+  jsonPageEnvelope,
+  renderList,
+  renderRecord,
+} from "./output";
+import {
+  collectPages,
+  type Page,
+  paginationFlagSpec,
+  paginationOptions,
+  paginationSearchParams,
+} from "./pagination";
 import {
   createPreviewCommand,
   listPreviewsCommand,
@@ -62,15 +87,18 @@ export { CLI_EXIT_API_ERROR, CLI_EXIT_OK, CLI_EXIT_USAGE_ERROR };
 
 export const canonicalCliCommands = [
   "login",
+  "usage",
+  "whoami",
   "projects list",
   "keys create",
   "keys list",
   "sandboxes create",
-  "sandboxes extend",
+  "sandboxes get",
   "sandboxes list",
   "sandboxes kill",
+  "sandboxes set-ttl",
   "commands run",
-  "commands start",
+  "commands get",
   "commands cancel",
   "logs",
   "shell",
@@ -79,6 +107,7 @@ export const canonicalCliCommands = [
   "files read",
   "files write",
   "files upload",
+  "files download",
   "files list",
   "files stat",
   "files mkdir",
@@ -130,6 +159,32 @@ export type CliOutput = {
 
 export type CliInput = AsyncIterable<string> | Iterable<string>;
 
+type ApiKeyListPayload = {
+  readonly data?: readonly Record<string, unknown>[];
+  readonly error?: {
+    readonly code?: string;
+    readonly details?: Readonly<Record<string, unknown>>;
+    readonly message?: string;
+  };
+  readonly hasMore?: boolean;
+  readonly nextCursor?: string;
+};
+
+type ApiKeyMetadataLookup = {
+  readonly metadata?: Record<string, unknown>;
+  readonly missingScope?: "api_key:read";
+};
+
+type CommandRunOptions = {
+  readonly background: boolean;
+  readonly collect?: readonly { readonly path: string }[];
+  readonly collectOn?: "always" | "success";
+};
+
+type CommandResult = {
+  readonly exitCode?: number;
+} & Record<string, unknown>;
+
 // eslint-disable-next-line complexity, max-lines-per-function -- Routing mirrors the public CLI command surface.
 export async function runCli(
   argv: readonly string[],
@@ -162,29 +217,31 @@ export async function runCli(
     "keys create": () => createApiKeyCommand(rest, environment, fetchImpl),
     "keys list": () => listApiKeysCommand(rest, environment, fetchImpl),
     "commands cancel": () => cancelCommand(client, rest),
-    "commands run": () => runCommand(client, rest),
-    "commands start": () => startCommand(client, rest),
+    "commands get": () => getCommand(client, rest),
+    "commands run": () => runCommand(rest, environment, fetchImpl),
     "code run": () => codeRunCommand(client, rest, output),
     "artifacts create": () => createArtifact(client, rest),
     "artifacts delete": () => deleteArtifact(client, rest),
     "artifacts download": () => downloadArtifact(client, rest),
-    "artifacts list": () => listArtifacts(client, rest),
+    "artifacts list": () => listArtifacts(rest, environment, fetchImpl),
     "files delete": () => deleteFileCommand(client, rest),
+    "files download": () => downloadFileCommand(client, rest),
     "files list": () => listFilesCommand(client, rest),
     "files mkdir": () => mkdirCommand(client, rest),
     "files move": () => moveFileCommand(client, rest),
     "files read": () => readFileCommand(client, rest),
     "files stat": () => statFileCommand(client, rest),
     "files upload": () => uploadFileCommand(client, rest),
-    "files write": () => writeFileCommand(client, rest),
+    "files write": () => writeFileCommand(client, rest, input),
     "previews create": () => createPreviewCommand(client, rest),
-    "previews list": () => listPreviewsCommand(client, rest),
+    "previews list": () => listPreviewsCommand(client, rest, environment, fetchImpl),
     "previews revoke": () => revokePreviewCommand(client, rest),
-    "projects list": () => listProjects(client, rest),
+    "projects list": () => listProjects(rest, environment, fetchImpl),
     "sandboxes create": () => createSandbox(client, rest),
-    "sandboxes extend": () => extendSandbox(client, rest),
+    "sandboxes get": () => getSandbox(client, rest),
     "sandboxes kill": () => killSandbox(client, rest),
-    "sandboxes list": () => listSandboxes(client, rest),
+    "sandboxes list": () => listSandboxes(rest, environment, fetchImpl),
+    "sandboxes set-ttl": () => setSandboxTtl(rest, environment, fetchImpl),
     "skills install": () => installSkillCommand(rest, environment),
   };
   const handler =
@@ -192,11 +249,24 @@ export async function runCli(
       ? () => logs(client, [action, ...rest], output)
       : resource === "login"
         ? () => Promise.resolve(loginCommand(compact([action, ...rest]), environment))
-        : resource === "shell"
-          ? () => shellCommand(client, compact([action, ...rest]), input, output)
-          : resource === "workspace-runs"
-            ? () => workspaceRunCommand(client, action, rest, { output })
-            : handlers[command];
+        : resource === "usage"
+          ? () => usageCommand(client, compact([action, ...rest]))
+          : resource === "whoami"
+            ? () => whoamiCommand(compact([action, ...rest]), environment, fetchImpl)
+            : resource === "shell"
+              ? () =>
+                  shellCommand(client, compact([action, ...rest]), input, output, {
+                    environment,
+                    fetchImpl,
+                  })
+              : resource === "workspace-runs"
+                ? () =>
+                    workspaceRunCommand(client, action, rest, {
+                      environment,
+                      fetchImpl,
+                      output,
+                    })
+                : handlers[command];
 
   try {
     if (handler) return normalizeCliResult(await handler(), wantsJson);
@@ -256,15 +326,26 @@ async function createSandbox(
 }
 
 async function listSandboxes(
-  client: () => CrowNestClient,
   args: readonly string[],
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
 ): Promise<CliResult> {
-  const json = parseJsonOnly(args, "sandboxes list");
-  const sandboxes = await client().sandboxes.list();
+  const parsed = parseFlags(args, { ...paginationFlagSpec, ...jsonFlagSpec });
+  rejectExtraPositionals(parsed.positionals, "sandboxes list");
+  const options = paginationOptions(parsed.flags);
+  const sandboxesPage = await collectPages(options, (cursor) =>
+    apiListPage<Record<string, unknown>>(
+      environment,
+      fetchImpl,
+      "/v1/sandboxes",
+      options,
+      cursor,
+    ),
+  );
   return ok(
-    json
-      ? jsonEnvelope(sandboxes)
-      : renderList(sandboxes, [
+    booleanFlag(parsed.flags, "--json")
+      ? jsonPageEnvelope(sandboxesPage)
+      : renderList(sandboxesPage.data, [
           { key: "id" },
           { key: "status" },
           { key: "templateSlug", label: "template" },
@@ -273,9 +354,23 @@ async function listSandboxes(
   );
 }
 
-async function extendSandbox(
+async function getSandbox(
   client: () => CrowNestClient,
   args: readonly string[],
+): Promise<CliResult> {
+  const parsed = parseFlags(args, jsonFlagSpec);
+  const sandboxId = requiredSandboxId(parsed.positionals[0], "sandbox id");
+  rejectExtraPositionals(parsed.positionals.slice(1), "sandboxes get");
+  const sandbox = await client().sandboxes.get(sandboxId);
+  return ok(
+    booleanFlag(parsed.flags, "--json") ? jsonEnvelope(sandbox) : renderRecord(sandbox),
+  );
+}
+
+async function setSandboxTtl(
+  args: readonly string[],
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
 ): Promise<CliResult> {
   const parsed = parseFlags(args, {
     "--ttl-ms": "string",
@@ -283,25 +378,45 @@ async function extendSandbox(
   });
   const ttlMs = positiveIntegerFlag(parsed.flags, "--ttl-ms");
   const sandboxId = requiredSandboxId(parsed.positionals[0], "sandbox id");
-  rejectExtraPositionals(parsed.positionals.slice(1), "sandboxes extend");
-  const extended = await client().sandboxes.extend(sandboxId, { ttlMs });
+  rejectExtraPositionals(parsed.positionals.slice(1), "sandboxes set-ttl");
+  const response = await apiPost<{ readonly sandbox: Record<string, unknown> }>(
+    environment,
+    fetchImpl,
+    `/v1/sandboxes/${sandboxId}/ttl`,
+    { ttlMs },
+  );
   return ok(
     booleanFlag(parsed.flags, "--json")
-      ? jsonEnvelope(extended)
-      : renderRecord(extended),
+      ? jsonEnvelope(response.sandbox)
+      : renderRecord(response.sandbox),
   );
 }
 
 async function listProjects(
-  client: () => CrowNestClient,
   args: readonly string[],
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
 ): Promise<CliResult> {
-  const json = parseJsonOnly(args, "projects list");
-  const projects = await client().projects.list();
+  const parsed = parseFlags(args, { ...paginationFlagSpec, ...jsonFlagSpec });
+  rejectExtraPositionals(parsed.positionals, "projects list");
+  const options = paginationOptions(parsed.flags);
+  const projectsPage = await collectPages(options, (cursor) =>
+    apiListPage<Record<string, unknown>>(
+      environment,
+      fetchImpl,
+      "/v1/projects",
+      options,
+      cursor,
+    ),
+  );
   return ok(
-    json
-      ? jsonEnvelope(projects)
-      : renderList(projects, [{ key: "id" }, { key: "name" }, { key: "orgId" }]),
+    booleanFlag(parsed.flags, "--json")
+      ? jsonPageEnvelope(projectsPage)
+      : renderList(projectsPage.data, [
+          { key: "id" },
+          { key: "name" },
+          { key: "orgId" },
+        ]),
   );
 }
 
@@ -319,17 +434,11 @@ async function killSandbox(
 }
 
 async function runCommand(
-  client: () => CrowNestClient,
   args: readonly string[],
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
 ): Promise<CliResult> {
-  return await executeCommand(client, args, "run");
-}
-
-async function startCommand(
-  client: () => CrowNestClient,
-  args: readonly string[],
-): Promise<CliResult> {
-  return await executeCommand(client, args, "start");
+  return await executeCommand(args, environment, fetchImpl);
 }
 
 async function cancelCommand(
@@ -345,6 +454,23 @@ async function cancelCommand(
   const command = await client().commands.cancel(commandId as `cmd_${string}`, {
     mode: booleanFlag(parsed.flags, "--force") ? "force" : "graceful",
   });
+  return ok(
+    booleanFlag(parsed.flags, "--json") ? jsonEnvelope(command) : renderRecord(command),
+  );
+}
+
+async function getCommand(
+  client: () => CrowNestClient,
+  args: readonly string[],
+): Promise<CliResult> {
+  const parsed = parseFlags(args, jsonFlagSpec);
+  const commandId = requiredPrefixedArg(
+    parsed.positionals[0],
+    "command id",
+    "cmd_",
+  ) as `cmd_${string}`;
+  rejectExtraPositionals(parsed.positionals.slice(1), "commands get");
+  const command = await client().commands.get(commandId);
   return ok(
     booleanFlag(parsed.flags, "--json") ? jsonEnvelope(command) : renderRecord(command),
   );
@@ -414,17 +540,27 @@ async function createArtifact(
 }
 
 async function listArtifacts(
-  client: () => CrowNestClient,
   args: readonly string[],
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
 ): Promise<CliResult> {
-  const parsed = parseFlags(args, jsonFlagSpec);
+  const parsed = parseFlags(args, { ...paginationFlagSpec, ...jsonFlagSpec });
   const sandboxId = requiredSandboxId(parsed.positionals[0], "sandbox id");
   rejectExtraPositionals(parsed.positionals.slice(1), "artifacts list");
-  const artifacts = await client().artifacts.list(sandboxId);
+  const options = paginationOptions(parsed.flags);
+  const artifactsPage = await collectPages(options, (cursor) =>
+    apiListPage<Record<string, unknown>>(
+      environment,
+      fetchImpl,
+      `/v1/sandboxes/${sandboxId}/artifacts`,
+      options,
+      cursor,
+    ),
+  );
   return ok(
     booleanFlag(parsed.flags, "--json")
-      ? jsonEnvelope(artifacts)
-      : renderList(artifacts, [
+      ? jsonPageEnvelope(artifactsPage)
+      : renderList(artifactsPage.data, [
           { key: "id" },
           { key: "name" },
           { key: "sizeBytes", label: "size" },
@@ -481,23 +617,149 @@ function requiredSandboxId(value: string | undefined, label: string): `sbx_${str
 }
 
 async function executeCommand(
-  client: () => CrowNestClient,
   args: readonly string[],
-  mode: "run" | "start",
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
 ): Promise<CliResult> {
   const sandboxId = requiredSandboxId(args[0], "sandbox id");
   const commandArgs = args.slice(1);
   const command = commandAfterSeparator(commandArgs);
-  const parsedOptions =
-    mode === "run"
-      ? runCommandOptions(commandOptionArgs(commandArgs))
-      : startCommandOptions(commandOptionArgs(commandArgs));
-  const result =
-    mode === "run"
-      ? await client().commands.run(sandboxId, command, parsedOptions.options)
-      : await client().commands.start(sandboxId, command, parsedOptions.options);
+  const parsedOptions = runCommandOptions(commandOptionArgs(commandArgs));
+  const response = await apiPost<{ readonly command: CommandResult }>(
+    environment,
+    fetchImpl,
+    `/v1/sandboxes/${sandboxId}/commands`,
+    {
+      command,
+      ...(parsedOptions.options.background ? { background: true } : {}),
+      ...(parsedOptions.options.collect === undefined
+        ? {}
+        : { collect: parsedOptions.options.collect }),
+      ...(parsedOptions.options.collectOn === undefined
+        ? {}
+        : { collectOn: parsedOptions.options.collectOn }),
+    },
+  );
+  const result = response.command;
 
-  return ok(parsedOptions.json ? jsonEnvelope(result) : renderRecord(result));
+  const stdout = parsedOptions.json ? jsonEnvelope(result) : renderRecord(result);
+  return {
+    exitCode:
+      !parsedOptions.options.background &&
+      result.exitCode !== undefined &&
+      result.exitCode !== 0
+        ? sandboxCommandExitCode(result.exitCode)
+        : CLI_EXIT_OK,
+    stderr: "",
+    stdout,
+  };
+}
+
+async function usageCommand(
+  client: () => CrowNestClient,
+  args: readonly string[],
+): Promise<CliResult> {
+  const json = parseJsonOnly(args, "usage");
+  const usage = await client().usage();
+  return ok(json ? jsonEnvelope(usage) : renderRecord(usage));
+}
+
+// eslint-disable-next-line complexity -- Credential introspection deliberately degrades across API-key, agent-token, and forbidden metadata responses.
+async function whoamiCommand(
+  args: readonly string[],
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
+): Promise<CliResult> {
+  const json = parseJsonOnly(args, "whoami");
+  const credential = configuredCredential(environment);
+  if (!credential) {
+    throw new Error(
+      "No CrowNest credential configured. Run `crownest login --api-key <key>` or set CROWNEST_API_KEY.",
+    );
+  }
+
+  const { credentialType, prefix } = credentialIdentity(credential);
+  const lookup = await findApiKeyMetadata(environment, fetchImpl, prefix);
+  const metadata = lookup.metadata;
+  const result = {
+    credentialType,
+    prefix,
+    name:
+      metadata?.name ??
+      (credentialType === "agent_token" ? "agent token" : "unavailable"),
+    orgId: metadata?.orgId ?? "unavailable",
+    projectIds:
+      metadata?.projectIds ?? (metadata === undefined ? "unavailable" : "all"),
+    scopes: metadata?.scopes ?? "unavailable",
+    verified: true,
+    ...(lookup.missingScope === undefined
+      ? {}
+      : {
+          missingScopes: [lookup.missingScope],
+          verificationNote:
+            "Credential verified, but api_key:read is missing; key metadata is unavailable.",
+        }),
+  };
+  return ok(json ? jsonEnvelope(result) : renderRecord(result));
+}
+
+async function findApiKeyMetadata(
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
+  prefix: string,
+): Promise<ApiKeyMetadataLookup> {
+  let cursor: string | undefined;
+  const seenCursors = new Set<string>();
+
+  for (;;) {
+    const path =
+      cursor === undefined
+        ? "/v1/api-keys"
+        : `/v1/api-keys?cursor=${encodeURIComponent(cursor)}`;
+    const response = await authenticatedFetch(environment, fetchImpl, path);
+    const payload = (await response.json()) as ApiKeyListPayload;
+    if (response.status === 403 && payload.error?.code === "forbidden") {
+      return { missingScope: "api_key:read" };
+    }
+    if (!response.ok) throwApiResponse(response, payload);
+
+    const metadata = payload.data?.find((key) => key.prefix === prefix);
+    if (metadata !== undefined) return { metadata };
+    if (payload.hasMore !== true) return {};
+    if (!payload.nextCursor || seenCursors.has(payload.nextCursor)) {
+      throw new Error("Paginated response hasMore=true without a new nextCursor.");
+    }
+    seenCursors.add(payload.nextCursor);
+    cursor = payload.nextCursor;
+  }
+}
+
+function credentialIdentity(credential: string): {
+  readonly credentialType: "agent_token" | "api_key";
+  readonly prefix: string;
+} {
+  if (credential.startsWith("cn_agent_")) {
+    return {
+      credentialType: "agent_token",
+      prefix: credential.split("_").slice(0, 3).join("_"),
+    };
+  }
+  return { credentialType: "api_key", prefix: credential.slice(0, 18) };
+}
+
+async function apiListPage<T>(
+  environment: CliEnvironment,
+  fetchImpl: typeof fetch | undefined,
+  path: string,
+  options: ReturnType<typeof paginationOptions>,
+  cursor: string | undefined,
+): Promise<Page<T>> {
+  const query = paginationSearchParams(options, cursor).toString();
+  return await apiGet<Page<T>>(
+    environment,
+    fetchImpl,
+    `${path}${query.length === 0 ? "" : `?${query}`}`,
+  );
 }
 
 function clientOptions(
@@ -552,9 +814,10 @@ function commandAfterSeparator(args: readonly string[]): string {
 
 function runCommandOptions(args: readonly string[]): {
   readonly json: boolean;
-  readonly options: RunCommandOptions;
+  readonly options: CommandRunOptions;
 } {
   const parsed = parseFlags(args, {
+    "--background": "boolean",
     "--collect": "string[]",
     "--collect-on": "string",
     ...jsonFlagSpec,
@@ -567,23 +830,22 @@ function runCommandOptions(args: readonly string[]): {
   if (collectOn !== undefined && collectOn !== "success" && collectOn !== "always") {
     throw new UsageError("collect-on must be success or always.");
   }
+  const background = booleanFlag(parsed.flags, "--background");
+  if (background && collect.length > 0) {
+    throw new UsageError("--background cannot be used with --collect.");
+  }
+  if (background && collectOn !== undefined) {
+    throw new UsageError("--background cannot be used with --collect-on.");
+  }
 
   return {
     json: booleanFlag(parsed.flags, "--json"),
     options: {
+      background,
       ...(collect.length === 0 ? {} : { collect }),
       ...(collectOn === undefined ? {} : { collectOn }),
     },
   };
-}
-
-function startCommandOptions(args: readonly string[]): {
-  readonly json: boolean;
-  readonly options: Record<string, never>;
-} {
-  const parsed = parseFlags(args, jsonFlagSpec);
-  rejectExtraPositionals(parsed.positionals, "commands start");
-  return { json: booleanFlag(parsed.flags, "--json"), options: {} };
 }
 
 function commandOptionArgs(args: readonly string[]): readonly string[] {
@@ -694,24 +956,35 @@ function isJsonObject(value: string): boolean {
 }
 
 async function main() {
-  const rl = createInterface({ input: process.stdin });
+  const argv = process.argv.slice(2);
+  const rawStdin = isFilesWriteStdin(argv);
+  if (rawStdin) process.stdin.setEncoding("utf8");
+  const rl = rawStdin ? undefined : createInterface({ input: process.stdin });
   const result = await runCli(
-    process.argv.slice(2),
+    argv,
     process.env,
     undefined,
     {
       stderr: process.stderr,
       stdout: process.stdout,
     },
-    rl,
+    rawStdin ? (process.stdin as AsyncIterable<string>) : rl,
   ).finally(() => {
-    rl.close();
+    rl?.close();
   });
 
   if (result.stdout.length > 0) process.stdout.write(result.stdout);
   if (result.stderr.length > 0) process.stderr.write(result.stderr);
 
   process.exitCode = result.exitCode;
+}
+
+function isFilesWriteStdin(argv: readonly string[]): boolean {
+  if (argv[0] !== "files" || argv[1] !== "write") return false;
+  const fileFlagIndex = argv.findIndex(
+    (value) => value === "--file" || value.startsWith("--file="),
+  );
+  return fileFlagIndex < 0 && argv.includes("-");
 }
 
 const currentModulePath = fileURLToPath(import.meta.url);

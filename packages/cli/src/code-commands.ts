@@ -7,7 +7,6 @@ import {
   renderCodeOutput,
   renderExecutionError,
   writeChunk,
-  writeCodeChunks,
   writeCodeOutputs,
 } from "./code-rendering";
 import { CLI_EXIT_API_ERROR, CLI_EXIT_OK, CLI_EXIT_USAGE_ERROR } from "./exit-codes";
@@ -137,10 +136,10 @@ async function collectCodeRunStream(
       case "complete":
         completed = true;
         if (!streamedStdout) {
-          stdout += writeCodeChunks(output?.stdout, event.data.stdout);
+          stdout += writeChunk(output?.stdout, event.data.stdout);
         }
         if (!streamedStderr) {
-          stderr += writeCodeChunks(output?.stderr, event.data.stderr);
+          stderr += writeChunk(output?.stderr, event.data.stderr);
         }
         if (!streamedOutput) {
           stdout += writeCodeOutputs(output?.stdout, event.data.outputs);

@@ -52,15 +52,15 @@ replay-sensitive mutating steps.
 
 ## Cleanup
 
-Extending a Sandbox resets its TTL from now. It does not pause, persist, or
+Setting a Sandbox TTL resets its countdown from now. It does not pause, persist, or
 revive expired Sandboxes.
 
 ```text
-extend_sandbox({ "sandbox_id": "sbx_...", "ttl_ms": 1800000 })
+set_sandbox_ttl({ "sandbox_id": "sbx_...", "ttl_ms": 1800000 })
 kill_sandbox({ "sandbox_id": "sbx_..." })
 ```
 
 ```bash
-crownest sandboxes extend "$SANDBOX" --ttl-ms 1800000
+crownest sandboxes set-ttl "$SANDBOX" --ttl-ms 1800000
 crownest sandboxes kill "$SANDBOX"
 ```

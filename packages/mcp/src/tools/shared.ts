@@ -53,6 +53,8 @@ export const sha256Schema = z
   .string()
   .regex(/^[a-fA-F0-9]{64}$/u, "Expected a 64-character hex sha256 digest.");
 export const idempotencyKeySchema = z.string().min(1).max(255);
+export const paginationCursorSchema = z.string().min(1);
+export const paginationLimitSchema = z.number().int().positive().max(500);
 export const sandboxStatusSchema = z.enum([
   "creating",
   "starting",
@@ -61,6 +63,16 @@ export const sandboxStatusSchema = z.enum([
   "idle",
   "expiring",
 ]);
+
+export function paginationInput(input: {
+  readonly cursor?: string | undefined;
+  readonly limit?: number | undefined;
+}): { readonly cursor?: string; readonly limit?: number } {
+  return {
+    ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+    ...(input.limit === undefined ? {} : { limit: input.limit }),
+  };
+}
 
 export async function handleTool(
   callback: () => Promise<CallToolResult>,

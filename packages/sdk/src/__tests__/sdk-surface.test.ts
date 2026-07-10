@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type {
   ApiKeyScope,
   CreateWorkspaceRunInput,
+  RunCommandOptions,
   WorkspaceRunsClient,
 } from "../index";
 import { ApiKeyScopes, createCrowNestClient } from "../index";
@@ -30,13 +31,27 @@ function registerFactoryTests() {
     expect(typeof client.code.listContexts).toBe("function");
     expect(typeof client.projects.create).toBe("function");
     expect(typeof client.sandboxes.create).toBe("function");
-    expect(typeof client.sandboxes.extend).toBe("function");
+    expect(typeof client.sandboxes.setTtl).toBe("function");
+    expect("extend" in client.sandboxes).toBe(false);
+    expect("start" in client.commands).toBe(false);
     expect(typeof client.sandboxes.get).toBe("function");
     expect(typeof client.usage).toBe("function");
     expect(ApiKeyScopes).toContain("workspace_run:create");
 
     const scope: ApiKeyScope = "workspace_run:read";
     expect(scope).toBe("workspace_run:read");
+  });
+
+  it("rejects collection options for background commands at the type level", () => {
+    const background: RunCommandOptions = { background: true };
+    // @ts-expect-error Background commands cannot collect artifacts.
+    const invalid: RunCommandOptions = {
+      background: true,
+      collect: [{ path: "/workspace/output.txt" }],
+    };
+
+    expect(background.background).toBe(true);
+    expect(invalid.background).toBe(true);
   });
 
   it("exposes CRUD completion helpers on root clients and sandbox handles", async () => {
@@ -87,7 +102,10 @@ function registerFactoryTests() {
       fetch: fetchMock,
     });
 
-    await expect(client.apiKeys.list()).resolves.toEqual([apiKey]);
+    await expect(client.apiKeys.list()).resolves.toEqual({
+      data: [apiKey],
+      hasMore: false,
+    });
     await expect(client.apiKeys.get("key_123")).resolves.toEqual(apiKey);
     await expect(client.apiKeys.revoke("key_123")).resolves.toMatchObject({
       revokedAt: "2026-06-09T16:00:00.000Z",
@@ -95,13 +113,19 @@ function registerFactoryTests() {
     await expect(
       client.projects.create({ name: "Agent Workspace" }),
     ).resolves.toMatchObject({ id: "prj_created" });
-    await expect(client.code.listContexts("sbx_123")).resolves.toEqual([context]);
+    await expect(client.code.listContexts("sbx_123")).resolves.toEqual({
+      data: [context],
+      hasMore: false,
+    });
     await expect(client.code.getContext("sbx_123", "cctx_123")).resolves.toEqual(
       context,
     );
 
     const sandbox = await client.sandboxes.get("sbx_123");
-    await expect(sandbox.code.listContexts()).resolves.toEqual([context]);
+    await expect(sandbox.code.listContexts()).resolves.toEqual({
+      data: [context],
+      hasMore: false,
+    });
     await expect(sandbox.code.getContext("cctx_123")).resolves.toEqual(context);
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
@@ -120,6 +144,31 @@ function registerFactoryTests() {
       body: JSON.stringify({ name: "Agent Workspace" }),
       method: "POST",
     });
+  });
+
+  it("returns sandbox handles from list and kill helpers", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          data: [sandboxBody()],
+          hasMore: false,
+        }),
+      )
+      .mockResolvedValueOnce(sandboxResponse({ status: "destroyed" }));
+    const client = createCrowNestClient({
+      apiKey: "cn_live_test",
+      baseUrl: "https://api.test",
+      fetch: fetchMock,
+    });
+
+    const listed = await client.sandboxes.list();
+    const killed = await client.sandboxes.kill("sbx_123");
+
+    expect(typeof listed.data[0]?.commands.run).toBe("function");
+    expect(typeof listed.data[0]?.files.read).toBe("function");
+    expect(typeof killed.kill).toBe("function");
+    expect(killed.status).toBe("destroyed");
   });
 }
 
@@ -147,8 +196,8 @@ function registerSandboxCodeHandleTests() {
             language: "javascript",
             outputs: [],
             sandboxId: "sbx_123",
-            stderr: [],
-            stdout: ["1\n"],
+            stderr: "",
+            stdout: "1\n",
           },
         }),
       )
@@ -363,11 +412,12 @@ function registerWorkspaceRunTypeSurfaceTests() {
     });
     await expect(
       typedClient.list({
+        limit: 25,
         metadata: { agent: "crabbox" },
         projectId: "prj_test",
         status: "running",
       }),
-    ).resolves.toHaveLength(1);
+    ).resolves.toMatchObject({ data: [{ id: "wsr_test" }], hasMore: false });
     await expect(
       typedClient.listEvents("wsr_test", { afterSeq: 9, limit: 2 }),
     ).resolves.toMatchObject({
@@ -406,7 +456,7 @@ function registerWorkspaceRunTypeSurfaceTests() {
       "https://api.test/v1/workspace-runs/wsr_test/archive/finalize",
       "https://api.test/v1/workspace-runs/wsr_test/start",
       "https://api.test/v1/workspace-runs/wsr_test",
-      "https://api.test/v1/workspace-runs?projectId=prj_test&status=running&metadata.agent=crabbox",
+      "https://api.test/v1/workspace-runs?limit=25&projectId=prj_test&status=running&metadata.agent=crabbox",
       "https://api.test/v1/workspace-runs/wsr_test/events?afterSeq=9&limit=2",
       "https://api.test/v1/workspace-runs/wsr_test/events?afterSeq=9&stream=true",
       "https://api.test/v1/workspace-runs/wsr_test/cancel",
@@ -421,6 +471,93 @@ function registerWorkspaceRunTypeSurfaceTests() {
     expect(stagedHeaders).toBeInstanceOf(Headers);
     expect((stagedHeaders as Headers).get("authorization")).toBeNull();
     expect((stagedHeaders as Headers).get("x-upload-token")).toBe("upload-token");
+  });
+
+  it("runs a Workspace Run archive in one helper call", async () => {
+    const workspaceRun = workspaceRunBody();
+    const transfer = {
+      checksumAlgorithm: "sha256",
+      expiresAt: "2026-06-17T12:10:00.000Z",
+      headers: { "x-upload-token": "upload-token" },
+      id: "upl_test",
+      maxSizeBytes: 1_000,
+      method: "PUT",
+      status: "pending",
+      uploadUrl: "https://uploads.test/wsr_test/upl_test",
+      workspaceRunId: "wsr_test",
+    } as const;
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ workspaceRun }))
+      .mockResolvedValueOnce(jsonResponse({ transfer }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          archive: { sha256: "abc", sizeBytes: 3 },
+          workspaceRun: { ...workspaceRun, status: "archive_uploaded" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ workspaceRun: { ...workspaceRun, status: "running" } }),
+      );
+    const client = createCrowNestClient({
+      apiKey: "cn_live_test",
+      baseUrl: "https://api.test",
+      fetch: fetchMock,
+    });
+    const runArchive = Reflect.get(client.workspaceRuns, "runArchive");
+
+    await expect(
+      runArchive({
+        archive: {
+          body: new Uint8Array([31, 139, 8]),
+          headers: { "content-length": "3" },
+          sha256: "abc",
+          sizeBytes: 3,
+        },
+        command: "pnpm test",
+        template: "python-node",
+      }),
+    ).resolves.toMatchObject({ id: "wsr_test", status: "running" });
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "https://api.test/v1/workspace-runs",
+      "https://api.test/v1/workspace-runs/wsr_test/archive-transfer",
+      "https://uploads.test/wsr_test/upl_test",
+      "https://api.test/v1/workspace-runs/wsr_test/archive/finalize",
+      "https://api.test/v1/workspace-runs/wsr_test/start",
+    ]);
+    const uploadHeaders = fetchMock.mock.calls[2]?.[1]?.headers;
+    expect(uploadHeaders).toBeInstanceOf(Headers);
+    expect((uploadHeaders as Headers).get("content-length")).toBe("3");
+    expect((uploadHeaders as Headers).get("x-upload-token")).toBe("upload-token");
+  });
+
+  it("waits until a Workspace Run reaches a terminal status", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({ workspaceRun: workspaceRunBody({ status: "running" }) }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ workspaceRun: workspaceRunBody({ status: "succeeded" }) }),
+      );
+    const client = createCrowNestClient({
+      apiKey: "cn_live_test",
+      baseUrl: "https://api.test",
+      fetch: fetchMock,
+    });
+
+    await expect(
+      client.workspaceRuns.waitUntilDone("wsr_test", {
+        intervalMs: 0,
+        timeoutMs: 1_000,
+      }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "https://api.test/v1/workspace-runs/wsr_test",
+      "https://api.test/v1/workspace-runs/wsr_test",
+    ]);
   });
 
   it("authenticates same-origin Workspace Run archive transfer targets only", async () => {
@@ -544,15 +681,18 @@ function registerSandboxCommandHandleTests() {
     });
 
     const sandbox = await client.sandboxes.create({ projectId: "prj_123" });
-    const extended = await sandbox.extend({
-      idempotencyKey: "extend-key",
+    expect("extend" in sandbox).toBe(false);
+    expect("start" in sandbox.commands).toBe(false);
+    expect(typeof sandbox.setTtl).toBe("function");
+    const ttlUpdated = await sandbox.setTtl({
+      idempotencyKey: "set-ttl-key",
       ttlMs: 5_400_000,
     });
-    const command = await extended.commands.run("python main.py");
-    const canceled = await extended.commands.cancel("cmd_123", { mode: "force" });
+    const command = await ttlUpdated.commands.run("python main.py");
+    const canceled = await ttlUpdated.commands.cancel("cmd_123", { mode: "force" });
 
     expect(sandbox.id).toBe("sbx_123");
-    expect(extended.ttlMs).toBe(5_400_000);
+    expect(ttlUpdated.ttlMs).toBe(5_400_000);
     expect(command.id).toBe("cmd_123");
     expect(canceled.status).toBe("canceled");
     expect(fetchMock).toHaveBeenCalledWith(
@@ -567,15 +707,15 @@ function registerSandboxCommandHandleTests() {
     expect((createHeaders as Headers).get("authorization")).toBe("Bearer cn_live_test");
     expect((createHeaders as Headers).get("idempotency-key")).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://api.test/v1/sandboxes/sbx_123/extend",
+      "https://api.test/v1/sandboxes/sbx_123/ttl",
       expect.objectContaining({
         body: JSON.stringify({ ttlMs: 5_400_000 }),
         method: "POST",
       }),
     );
-    const extendHeaders = fetchMock.mock.calls[1]?.[1]?.headers;
-    expect(extendHeaders).toBeInstanceOf(Headers);
-    expect((extendHeaders as Headers).get("idempotency-key")).toBe("extend-key");
+    const setTtlHeaders = fetchMock.mock.calls[1]?.[1]?.headers;
+    expect(setTtlHeaders).toBeInstanceOf(Headers);
+    expect((setTtlHeaders as Headers).get("idempotency-key")).toBe("set-ttl-key");
     expect(fetchMock).toHaveBeenCalledWith(
       "https://api.test/v1/commands/cmd_123/cancel",
       expect.objectContaining({
@@ -583,6 +723,66 @@ function registerSandboxCommandHandleTests() {
         method: "POST",
       }),
     );
+  });
+
+  it("exposes command get, logs, and stream helpers on sandbox handles", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(sandboxResponse())
+      .mockResolvedValueOnce(commandResponse("running"))
+      .mockResolvedValueOnce(commandLogsResponse())
+      .mockResolvedValueOnce(commandStreamResponse());
+    const client = createCrowNestClient({
+      apiKey: "cn_live_test",
+      baseUrl: "https://api.test",
+      fetch: fetchMock,
+    });
+    const sandbox = await client.sandboxes.get("sbx_123");
+
+    await expect(sandbox.commands.get("cmd_123")).resolves.toMatchObject({
+      id: "cmd_123",
+    });
+    await expect(sandbox.commands.logs("cmd_123")).resolves.toMatchObject({
+      data: [{ seq: 1 }],
+    });
+
+    const events = [];
+    for await (const event of sandbox.commands.streamLogs("cmd_123", {
+      reconnect: false,
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      {
+        createdAt: "2026-06-09T15:30:00.000Z",
+        data: "ready\n",
+        seq: 1,
+        stream: "stdout",
+        type: "log",
+      },
+    ]);
+  });
+
+  it("waits until a sandbox handle is ready", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(sandboxResponse({ status: "creating" }))
+      .mockResolvedValueOnce(sandboxResponse({ status: "ready" }));
+    const client = createCrowNestClient({
+      apiKey: "cn_live_test",
+      baseUrl: "https://api.test",
+      fetch: fetchMock,
+    });
+    const sandbox = await client.sandboxes.get("sbx_123");
+
+    await expect(
+      sandbox.waitUntilReady({ intervalMs: 0, timeoutMs: 1_000 }),
+    ).resolves.toMatchObject({ status: "ready" });
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "https://api.test/v1/sandboxes/sbx_123",
+      "https://api.test/v1/sandboxes/sbx_123",
+    ]);
   });
 }
 
@@ -613,6 +813,18 @@ function registerSandboxFileArtifactHandleTests() {
       .mockResolvedValueOnce(
         jsonResponse({ data: [artifactResponseBody()], hasMore: false }),
       )
+      .mockResolvedValueOnce(jsonResponse({ artifact: artifactResponseBody() }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          authMode: "api_key",
+          headers: { "x-content-type-options": "nosniff" },
+          method: "GET",
+          url: "https://api.test/v1/artifacts/art_123/download",
+        }),
+      );
+    fetchMock
+      .mockResolvedValueOnce(new Response("hello"))
+      .mockResolvedValueOnce(jsonResponse({ artifact: artifactResponseBody() }))
       .mockResolvedValueOnce(
         jsonResponse({
           authMode: "api_key",
@@ -633,11 +845,28 @@ function registerSandboxFileArtifactHandleTests() {
       sandbox.files.write("/workspace/input.txt", "hello"),
     ).resolves.toMatchObject({ path: "/workspace/input.txt" });
     await expect(sandbox.files.read("/workspace/input.txt")).resolves.toBe("hello");
-    await expect(sandbox.files.list()).resolves.toHaveLength(1);
+    await expect(sandbox.files.list()).resolves.toMatchObject({
+      data: [{ path: "/workspace/input.txt" }],
+    });
     await expect(
       sandbox.artifacts.create({ path: "/workspace/input.txt" }),
     ).resolves.toMatchObject({ id: "art_123" });
-    await expect(sandbox.artifacts.list()).resolves.toHaveLength(1);
+    await expect(sandbox.artifacts.list()).resolves.toMatchObject({
+      data: [{ id: "art_123" }],
+      hasMore: false,
+    });
+    await expect(sandbox.artifacts.get("art_123")).resolves.toMatchObject({
+      id: "art_123",
+    });
+    await expect(sandbox.artifacts.downloadUrl("art_123")).resolves.toMatchObject({
+      method: "GET",
+    });
+    await expect(sandbox.artifacts.download("art_123")).resolves.toEqual(
+      new TextEncoder().encode("hello"),
+    );
+    await expect(sandbox.artifacts.delete("art_123")).resolves.toMatchObject({
+      id: "art_123",
+    });
     await expect(client.artifacts.downloadUrl("art_123")).resolves.toMatchObject({
       method: "GET",
     });
@@ -724,7 +953,7 @@ function registerCommandCollectTests() {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://api.test/v1/sandboxes/sbx_123/commands/run",
+      "https://api.test/v1/sandboxes/sbx_123/commands",
       expect.objectContaining({
         body: JSON.stringify({
           command: "python script.py",
@@ -753,15 +982,18 @@ function registerCommandClientTests() {
     await expect(
       client.commands.cancel("cmd_123", { mode: "force" }),
     ).resolves.toMatchObject({ cancelMode: "force", status: "canceled" });
-    await expect(client.commands.logs("cmd_123")).resolves.toEqual([
-      {
-        commandId: "cmd_123",
-        createdAt: "2026-06-09T15:30:00.000Z",
-        data: "ready\n",
-        seq: 1,
-        stream: "stdout",
-      },
-    ]);
+    await expect(client.commands.logs("cmd_123")).resolves.toEqual({
+      data: [
+        {
+          commandId: "cmd_123",
+          createdAt: "2026-06-09T15:30:00.000Z",
+          data: "ready\n",
+          seq: 1,
+          stream: "stdout",
+        },
+      ],
+      hasMore: false,
+    });
 
     const events = [];
     for await (const event of client.commands.streamLogs("cmd_123", {

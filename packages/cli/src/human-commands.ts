@@ -12,7 +12,14 @@ import {
   UsageError,
 } from "./flags";
 import type { CliEnvironment, CliResult } from "./index";
-import { jsonEnvelope, renderList, renderRecord } from "./output";
+import { jsonEnvelope, jsonPageEnvelope, renderList, renderRecord } from "./output";
+import {
+  collectPages,
+  type Page,
+  paginationFlagSpec,
+  paginationOptions,
+  paginationSearchParams,
+} from "./pagination";
 
 type HumanSession = {
   readonly orgId: `org_${string}`;
@@ -125,37 +132,50 @@ export async function listApiKeysCommand(
 ): Promise<CliResult> {
   const parsed = parseFlags(args, {
     "--api-url": "string",
+    ...paginationFlagSpec,
     ...jsonFlagSpec,
   });
   rejectExtraPositionals(parsed.positionals, "keys list");
   const session = humanSession(environment, "keys list");
-  const response = await fetchImpl(`${apiBaseUrl(parsed, environment)}/v1/api-keys`, {
-    headers: {
-      "x-crownest-org-id": session.orgId,
-      "x-crownest-role": session.role,
-      "x-crownest-user-id": session.userId,
-    },
-    method: "GET",
-  });
-  const payload = (await response.json()) as ApiErrorPayload & {
-    readonly data?: readonly Record<string, unknown>[];
-    readonly error?: { readonly message: string };
-  };
-
-  if (!response.ok) {
-    throwApiError(
-      response,
-      payload,
-      "api_key_listing_failed",
-      "API key listing failed.",
+  const options = paginationOptions(parsed.flags);
+  const keysPage = await collectPages(options, async (cursor) => {
+    const query = paginationSearchParams(options, cursor).toString();
+    const response = await fetchImpl(
+      `${apiBaseUrl(parsed, environment)}/v1/api-keys${query.length === 0 ? "" : `?${query}`}`,
+      {
+        headers: {
+          "x-crownest-org-id": session.orgId,
+          "x-crownest-role": session.role,
+          "x-crownest-user-id": session.userId,
+        },
+        method: "GET",
+      },
     );
-  }
+    const payload = (await response.json()) as ApiErrorPayload & {
+      readonly data?: readonly Record<string, unknown>[];
+      readonly error?: { readonly message: string };
+      readonly hasMore?: boolean;
+      readonly nextCursor?: string;
+    };
 
-  const keys = payload.data ?? [];
+    if (!response.ok) {
+      throwApiError(
+        response,
+        payload,
+        "api_key_listing_failed",
+        "API key listing failed.",
+      );
+    }
+    return {
+      data: payload.data ?? [],
+      hasMore: payload.hasMore ?? false,
+      ...(payload.nextCursor === undefined ? {} : { nextCursor: payload.nextCursor }),
+    } satisfies Page<Record<string, unknown>>;
+  });
   return ok(
     booleanFlag(parsed.flags, "--json")
-      ? jsonEnvelope(keys)
-      : renderList(keys, [
+      ? jsonPageEnvelope(keysPage)
+      : renderList(keysPage.data, [
           { key: "id" },
           { key: "name" },
           { key: "prefix" },

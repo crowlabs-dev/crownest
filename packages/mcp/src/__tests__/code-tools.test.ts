@@ -78,8 +78,8 @@ function codeRunResult() {
       },
     ],
     sandboxId: "sbx_code",
-    stderr: ["warn"],
-    stdout: ["out"],
+    stderr: "warn",
+    stdout: "out",
   };
 }
 
@@ -95,8 +95,8 @@ function shortErrorResult() {
     language: "python",
     outputs: [],
     sandboxId: "sbx_code",
-    stderr: [],
-    stdout: [],
+    stderr: "",
+    stdout: "",
   };
 }
 
@@ -108,7 +108,7 @@ function longErrorResult() {
     language: "python",
     outputs: [],
     sandboxId: "sbx_code",
-    stderr: [],
-    stdout: [],
+    stderr: "",
+    stdout: "",
   };
 }

@@ -25,6 +25,14 @@ describe("crownestOpenApiDocument", () => {
       crownestOpenApiDocument.paths["/v1/workspace-runs/{workspaceRunId}/events"],
     ).toBeDefined();
     expect(crownestOpenApiDocument.components.schemas.ApiErrorResponse).toMatchObject({
+      properties: {
+        error: {
+          properties: {
+            requestId: { type: "string" },
+            retryable: { type: "boolean" },
+          },
+        },
+      },
       required: ["error"],
     });
     expect(crownestOpenApiDocument.components.schemas.ApiKeyScope.enum).toContain(
@@ -36,6 +44,38 @@ describe("crownestOpenApiDocument", () => {
     expect(
       JSON.stringify(crownestOpenApiDocument.paths["/v1/sandboxes"]?.post),
     ).toContain("#/components/parameters/idempotencyKey");
+  });
+
+  it("documents cursor pagination on every resource list", () => {
+    const listPaths = [
+      "/v1/projects",
+      "/v1/api-keys",
+      "/v1/sandboxes",
+      "/v1/sandboxes/{sandboxId}/code/contexts",
+      "/v1/sandboxes/{sandboxId}/artifacts",
+      "/v1/sandboxes/{sandboxId}/previews",
+      "/v1/workspace-runs",
+    ] as const;
+
+    for (const path of listPaths) {
+      expect(parameterNames(operation("GET", path))).toEqual(
+        expect.arrayContaining([
+          "#/components/parameters/cursor",
+          "#/components/parameters/limit",
+        ]),
+      );
+    }
+  });
+
+  it("documents correlation, retry, and rate-limit response headers", () => {
+    const responses = operation("GET", "/v1/sandboxes").responses as Record<
+      string,
+      { headers?: Record<string, unknown> }
+    >;
+    expect(responses["200"]?.headers).toHaveProperty("x-request-id");
+    expect(responses["200"]?.headers).toHaveProperty("X-RateLimit-Limit");
+    expect(responses["429"]?.headers).toHaveProperty("Retry-After");
+    expect(responses["503"]?.headers).toHaveProperty("Retry-After");
   });
 
   it("documents file query parameters without adding cursor pagination", () => {
@@ -62,6 +102,50 @@ describe("crownestOpenApiDocument", () => {
       responseStatuses("POST", "/v1/commands/{commandId}/logs/download-url"),
     ).not.toContain("201");
     expect(responseStatuses("POST", "/v1/sandboxes")).toContain("201");
+  });
+
+  it("documents canonical command execution and deprecated aliases", () => {
+    const canonical = operation("POST", "/v1/sandboxes/{sandboxId}/commands");
+    expect(responseStatuses("POST", "/v1/sandboxes/{sandboxId}/commands")).toEqual(
+      expect.arrayContaining(["200", "202"]),
+    );
+    expect(parameterNames(canonical)).toContain(
+      "#/components/parameters/idempotencyKey",
+    );
+    expect(crownestOpenApiDocument.components.schemas.RunCommandBody).toMatchObject({
+      properties: { background: { default: false, type: "boolean" } },
+      required: ["command"],
+    });
+
+    for (const path of [
+      "/v1/sandboxes/{sandboxId}/commands/run",
+      "/v1/sandboxes/{sandboxId}/commands/start",
+    ] as const) {
+      const alias = operation("POST", path);
+      expect(alias.deprecated).toBe(true);
+      for (const status of responseStatuses("POST", path)) {
+        expect(alias.responses[status]).toHaveProperty("headers.Deprecation");
+        expect(alias.responses[status]).toHaveProperty("headers.Sunset");
+        expect(alias.responses[status]).toHaveProperty("headers.Link");
+      }
+    }
+  });
+
+  it("documents set-TTL semantics and the deprecated extend alias", () => {
+    const canonical = operation("POST", "/v1/sandboxes/{sandboxId}/ttl");
+    expect(canonical.description).toContain("resets the expiration countdown");
+    expect(parameterNames(canonical)).toContain(
+      "#/components/parameters/idempotencyKey",
+    );
+    expect(crownestOpenApiDocument.components.schemas.SetSandboxTtlBody).toMatchObject({
+      required: ["ttlMs"],
+    });
+
+    const alias = operation("POST", "/v1/sandboxes/{sandboxId}/extend");
+    expect(alias.deprecated).toBe(true);
+    expect(alias.responses["200"]).toHaveProperty("headers.Deprecation");
+    expect(alias.responses["200"]).toHaveProperty("headers.Sunset");
+    expect(alias.responses["200"]).toHaveProperty("headers.Link");
   });
 
   it("excludes dashboard-only routes from the public contract", () => {
@@ -136,7 +220,10 @@ describe("crownestOpenApiDocument", () => {
       "uploadId",
       "content-length",
     ]);
-    expect(uploadTransfer.responses["204"]).toEqual({ description: "Success." });
+    expect(uploadTransfer.responses["204"]).toMatchObject({
+      description: "Success.",
+    });
+    expect(uploadTransfer.responses["204"]).toHaveProperty("headers.x-request-id");
 
     const finalize = operation(
       "POST",
@@ -188,6 +275,8 @@ function requestMediaTypes(spec: OpenApiOperation): readonly string[] {
 }
 
 type OpenApiOperation = {
+  readonly deprecated?: boolean;
+  readonly description?: string;
   readonly parameters: readonly OpenApiParameter[];
   readonly requestBody?: unknown;
   readonly responses: Readonly<Record<string, unknown>>;

@@ -16,8 +16,9 @@ export function registerRunCommand(server: McpServer, session: McpSession): void
     "run_command",
     {
       description:
-        "Run a Command in a CrowNest Sandbox. Omit sandbox_id to lazily create or reuse the MCP session's default Sandbox. The default cwd is /workspace; returns command_id, sandbox_id, exit code, stdout, and stderr.",
+        "Run a Command in a CrowNest Sandbox. Omit sandbox_id to lazily create or reuse the MCP session's default Sandbox; the default cwd is /workspace. Foreground mode is the default: it waits for completion and returns terminal status, exit code, stdout, and stderr. Set background to true to return the started Command immediately, then use get_command or stream_command_logs to follow it.",
       inputSchema: z.object({
+        background: z.boolean().default(false),
         command: z.string(),
         cwd: z.string().optional(),
         sandbox_id: sandboxIdSchema.optional(),
@@ -29,45 +30,27 @@ export function registerRunCommand(server: McpServer, session: McpSession): void
         const sandbox = await session.resolveSandbox(
           input.sandbox_id as `sbx_${string}` | undefined,
         );
-        const command = await sandbox.commands.run(input.command, {
+        const commonOptions = {
           ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
           ...(input.timeout_ms === undefined ? {} : { timeoutMs: input.timeout_ms }),
-        });
+        };
+        const command = input.background
+          ? await sandbox.commands.run(input.command, {
+              ...commonOptions,
+              background: true,
+            })
+          : await sandbox.commands.run(input.command, commonOptions);
+        if (input.background) {
+          return formatCommandDetails(command);
+        }
         return formatCommand({
           commandId: command.id,
           sandboxId: sandbox.id,
+          status: command.status,
           stderr: command.stderr ?? "",
           stdout: command.stdout ?? "",
           ...(command.exitCode === undefined ? {} : { exitCode: command.exitCode }),
         });
-      }),
-  );
-}
-
-export function registerStartCommand(server: McpServer, session: McpSession): void {
-  server.registerTool(
-    "start_command",
-    {
-      description:
-        "Start a CrowNest Command in a Sandbox without waiting for completion. Omit sandbox_id to lazily create or reuse the MCP session's default Sandbox, or pass sandbox_id to target and adopt a visible Sandbox. Use get_command and stream_command_logs to inspect progress.",
-      inputSchema: z.object({
-        command: z.string(),
-        cwd: z.string().optional(),
-        sandbox_id: sandboxIdSchema.optional(),
-        timeout_ms: z.number().int().positive().optional(),
-      }),
-    },
-    (input) =>
-      handleTool(async () => {
-        const sandbox = await session.resolveSandbox(
-          input.sandbox_id as `sbx_${string}` | undefined,
-        );
-        return formatCommandDetails(
-          await sandbox.commands.start(input.command, {
-            ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
-            ...(input.timeout_ms === undefined ? {} : { timeoutMs: input.timeout_ms }),
-          }),
-        );
       }),
   );
 }
@@ -131,10 +114,10 @@ export function registerStreamCommandLogs(
       handleTool(async () => {
         const maxLines = input.max_lines ?? DEFAULT_COMMAND_LOG_LINES;
         const commandId = input.command_id as `cmd_${string}`;
-        const chunks = await session.client.commands.logs(commandId, {
+        const chunksPage = await session.client.commands.logs(commandId, {
           limit: maxLines + 1,
         });
-        return formatCommandLogs(commandId, chunks, maxLines);
+        return formatCommandLogs(commandId, chunksPage.data, maxLines);
       }),
   );
 }

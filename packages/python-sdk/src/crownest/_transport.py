@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import random
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
-from typing import Any
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from importlib.metadata import PackageNotFoundError, version
+from typing import Any, Awaitable, Callable
 from urllib.parse import ParseResult, urlparse
 
 import httpx
@@ -17,6 +23,12 @@ MAX_BLOCKING_COMMAND_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_TIMEOUT_SECONDS = MAX_BLOCKING_COMMAND_TIMEOUT_SECONDS + 60
 TimeoutConfig = float | httpx.Timeout | None
 
+try:
+    _SDK_VERSION = version("crownest")
+except PackageNotFoundError:
+    _SDK_VERSION = "0.1.2"
+_SDK_IDENTIFIER = f"crownest-python/{_SDK_VERSION}"
+
 
 class SyncTransport:
     def __init__(
@@ -25,10 +37,14 @@ class SyncTransport:
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         http_client: httpx.Client | None = None,
+        max_retries: int = 2,
         timeout: TimeoutConfig = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._api_key = _resolve_api_key(api_key)
         self._base_url = base_url.rstrip("/")
+        self._max_retries = max_retries
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative.")
         self._owns_client = http_client is None
         self._client = http_client or httpx.Client(timeout=timeout)
 
@@ -51,19 +67,27 @@ class SyncTransport:
             idempotency_key=idempotency_key,
             idempotent=idempotent,
         )
-        response = self._client.request(
-            method,
-            self._url(path),
-            headers=headers,
-            json=body,
+        response = _request_with_retries(
+            lambda: self._client.request(
+                method,
+                self._url(path),
+                headers=headers,
+                json=body,
+            ),
+            can_retry=method == "GET" or "idempotency-key" in headers,
+            max_retries=self._max_retries,
         )
         _raise_for_error(response)
         return response.json()
 
     def download(self, url: str) -> bytes:
-        response = self._client.get(
-            self._url(url),
-            headers=self._headers(accept="application/octet-stream"),
+        response = _request_with_retries(
+            lambda: self._client.get(
+                self._url(url),
+                headers=self._headers(accept="application/octet-stream"),
+            ),
+            can_retry=True,
+            max_retries=self._max_retries,
         )
         _raise_for_error(response)
         return response.content
@@ -80,18 +104,23 @@ class SyncTransport:
         auth: str = "api",
     ) -> httpx.Response:
         url = self._url(path)
-        response = self._client.request(
-            method,
+        request_headers = self._raw_headers(
             url,
-            content=content,
-            headers=self._raw_headers(
+            accept="application/json",
+            auth=auth,
+            headers=headers,
+            idempotency_key=idempotency_key,
+            idempotent=idempotent,
+        )
+        response = _request_with_retries(
+            lambda: self._client.request(
+                method,
                 url,
-                accept="application/json",
-                auth=auth,
-                headers=headers,
-                idempotency_key=idempotency_key,
-                idempotent=idempotent,
+                content=content,
+                headers=request_headers,
             ),
+            can_retry=method == "GET" or "idempotency-key" in request_headers,
+            max_retries=self._max_retries,
         )
         _raise_for_error(response)
         return response
@@ -132,6 +161,8 @@ class SyncTransport:
         headers = {
             "accept": accept,
             "authorization": f"Bearer {self._api_key}",
+            "user-agent": _SDK_IDENTIFIER,
+            "x-crownest-sdk": _SDK_IDENTIFIER,
         }
         if has_json_body:
             headers["content-type"] = "application/json"
@@ -151,7 +182,11 @@ class SyncTransport:
         idempotency_key: str | None = None,
         idempotent: bool = False,
     ) -> dict[str, str]:
-        request_headers = {"accept": accept}
+        request_headers = {
+            "accept": accept,
+            "user-agent": _SDK_IDENTIFIER,
+            "x-crownest-sdk": _SDK_IDENTIFIER,
+        }
         if _should_send_auth(auth, self._base_url, url):
             request_headers["authorization"] = f"Bearer {self._api_key}"
         if idempotency_key is not None:
@@ -172,10 +207,14 @@ class AsyncTransport:
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         http_client: httpx.AsyncClient | None = None,
+        max_retries: int = 2,
         timeout: TimeoutConfig = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._api_key = _resolve_api_key(api_key)
         self._base_url = base_url.rstrip("/")
+        self._max_retries = max_retries
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative.")
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(timeout=timeout)
 
@@ -198,19 +237,27 @@ class AsyncTransport:
             idempotency_key=idempotency_key,
             idempotent=idempotent,
         )
-        response = await self._client.request(
-            method,
-            self._url(path),
-            headers=headers,
-            json=body,
+        response = await _async_request_with_retries(
+            lambda: self._client.request(
+                method,
+                self._url(path),
+                headers=headers,
+                json=body,
+            ),
+            can_retry=method == "GET" or "idempotency-key" in headers,
+            max_retries=self._max_retries,
         )
         _raise_for_error(response)
         return response.json()
 
     async def download(self, url: str) -> bytes:
-        response = await self._client.get(
-            self._url(url),
-            headers=self._headers(accept="application/octet-stream"),
+        response = await _async_request_with_retries(
+            lambda: self._client.get(
+                self._url(url),
+                headers=self._headers(accept="application/octet-stream"),
+            ),
+            can_retry=True,
+            max_retries=self._max_retries,
         )
         _raise_for_error(response)
         return response.content
@@ -227,18 +274,23 @@ class AsyncTransport:
         auth: str = "api",
     ) -> httpx.Response:
         url = self._url(path)
-        response = await self._client.request(
-            method,
+        request_headers = self._raw_headers(
             url,
-            content=content,
-            headers=self._raw_headers(
+            accept="application/json",
+            auth=auth,
+            headers=headers,
+            idempotency_key=idempotency_key,
+            idempotent=idempotent,
+        )
+        response = await _async_request_with_retries(
+            lambda: self._client.request(
+                method,
                 url,
-                accept="application/json",
-                auth=auth,
-                headers=headers,
-                idempotency_key=idempotency_key,
-                idempotent=idempotent,
+                content=content,
+                headers=request_headers,
             ),
+            can_retry=method == "GET" or "idempotency-key" in request_headers,
+            max_retries=self._max_retries,
         )
         _raise_for_error(response)
         return response
@@ -280,6 +332,8 @@ class AsyncTransport:
         headers = {
             "accept": accept,
             "authorization": f"Bearer {self._api_key}",
+            "user-agent": _SDK_IDENTIFIER,
+            "x-crownest-sdk": _SDK_IDENTIFIER,
         }
         if has_json_body:
             headers["content-type"] = "application/json"
@@ -299,7 +353,11 @@ class AsyncTransport:
         idempotency_key: str | None = None,
         idempotent: bool = False,
     ) -> dict[str, str]:
-        request_headers = {"accept": accept}
+        request_headers = {
+            "accept": accept,
+            "user-agent": _SDK_IDENTIFIER,
+            "x-crownest-sdk": _SDK_IDENTIFIER,
+        }
         if _should_send_auth(auth, self._base_url, url):
             request_headers["authorization"] = f"Bearer {self._api_key}"
         if idempotency_key is not None:
@@ -357,10 +415,16 @@ def _parse_sse_payload(event: str) -> Json | None:
 
 
 def _resolve_api_key(api_key: str | None) -> str:
-    resolved = api_key if api_key is not None else os.environ.get("CROWNEST_API_KEY")
+    resolved = api_key
+    if resolved is None:
+        resolved = os.environ.get("CROWNEST_BEARER_TOKEN") or os.environ.get(
+            "CROWNEST_API_KEY"
+        )
     if not resolved:
         raise ValueError(
-            "CrowNest API key missing. Pass api_key to CrowNest or set CROWNEST_API_KEY."
+            "CrowNest bearer credential missing. Pass credential to CrowNest or set "
+            "CROWNEST_BEARER_TOKEN. CROWNEST_API_KEY remains supported for "
+            "developer API keys."
         )
     return resolved
 
@@ -392,7 +456,99 @@ def _raise_for_error(response: httpx.Response) -> None:
                 ),
             }
 
-    raise CrowNestApiError(response.status_code, error)
+    raise CrowNestApiError(
+        response.status_code,
+        error,
+        request_id=response.headers.get("x-request-id"),
+        retry_after_seconds=_retry_after_seconds(response),
+    )
+
+
+def _request_with_retries(
+    send: Callable[[], httpx.Response],
+    *,
+    can_retry: bool,
+    max_retries: int,
+) -> httpx.Response:
+    attempt = 0
+    while True:
+        try:
+            response = send()
+        except httpx.HTTPError:
+            if not can_retry or attempt >= max_retries:
+                raise
+            time.sleep(_retry_delay_seconds(attempt))
+        else:
+            if (
+                response.is_success
+                or not can_retry
+                or attempt >= max_retries
+                or not _retryable_status(response.status_code)
+            ):
+                return response
+            retry_after = _retry_after_seconds(response)
+            time.sleep(
+                retry_after
+                if retry_after is not None
+                else _retry_delay_seconds(attempt)
+            )
+        attempt += 1
+
+
+async def _async_request_with_retries(
+    send: Callable[[], Awaitable[httpx.Response]],
+    *,
+    can_retry: bool,
+    max_retries: int,
+) -> httpx.Response:
+    attempt = 0
+    while True:
+        try:
+            response = await send()
+        except httpx.HTTPError:
+            if not can_retry or attempt >= max_retries:
+                raise
+            await asyncio.sleep(_retry_delay_seconds(attempt))
+        else:
+            if (
+                response.is_success
+                or not can_retry
+                or attempt >= max_retries
+                or not _retryable_status(response.status_code)
+            ):
+                return response
+            retry_after = _retry_after_seconds(response)
+            await asyncio.sleep(
+                retry_after
+                if retry_after is not None
+                else _retry_delay_seconds(attempt)
+            )
+        attempt += 1
+
+
+def _retryable_status(status: int) -> bool:
+    return status in {429, 500, 502, 503, 504}
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    value = response.headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    maximum = min(4.0, 0.25 * 2**attempt)
+    return random.uniform(maximum / 2, maximum)
 
 
 def _resolve_url(base_url: str, value: str) -> str:

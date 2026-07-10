@@ -1,24 +1,28 @@
 import type {
   Artifact,
+  ArtifactDownloadUrlResponse,
   CodeArtifactPolicy,
   CodeContextRef,
   CodeLanguage,
   CodeRunEvent,
   Command,
+  CommandLogStreamEvent,
   CreateArtifactResponse,
   CreateCodeContextResponse,
   CreatePreviewResponse,
+  DeleteArtifactResponse,
   DeleteCodeContextResponse,
-  DeleteFileResponse,
-  ExtendSandboxResponse,
+  DeletePreviewResponse,
   FileDownloadUrlResponse,
   FileEncoding,
-  FileEntry,
   FileStat,
+  GetArtifactResponse,
   GetCodeContextResponse,
-  GetSandboxResponse,
+  GetPreviewResponse,
+  KillSandboxResponse,
   ListArtifactsResponse,
   ListCodeContextsResponse,
+  ListCommandLogsResponse,
   ListFilesResponse,
   ListPreviewsResponse,
   Preview,
@@ -26,11 +30,21 @@ import type {
   RunCodeResponse,
   RunCodeResult,
   Sandbox,
+  SetSandboxTtlResponse,
 } from "@crownest/contracts";
 
-import { base64ToBytes, bytesToBase64 } from "./byte-utils";
-import { runCommandWithCallbacks } from "./command-stream";
-import { cancelCommand, type RunCommandOptions, type Transport } from "./protocol";
+import type {
+  CommandStreamInput,
+  ListInput,
+  WaitForCommandInput,
+  WaitUntilReadyInput,
+} from "./client-types";
+import type { AutoPage } from "./pagination";
+import { createPage, paginationParams } from "./pagination";
+import { queryString, type RunCommandOptions, type Transport } from "./protocol";
+import { createSandboxCommands } from "./sandbox-commands-client";
+import { createSandboxFilesClient } from "./sandbox-files-client";
+import { waitUntilSandboxReady } from "./sandbox-wait";
 
 export type SandboxHandle = Sandbox & {
   readonly artifacts: {
@@ -40,8 +54,16 @@ export type SandboxHandle = Sandbox & {
       readonly name?: string;
       readonly path: string;
     }): Promise<Artifact>;
+    /** Delete an Artifact exported from this Sandbox. */
+    delete(artifactId: `art_${string}`): Promise<Artifact>;
+    /** Download Artifact bytes. */
+    download(artifactId: `art_${string}`): Promise<Uint8Array>;
+    /** Create or reuse a short-lived Artifact download URL. */
+    downloadUrl(artifactId: `art_${string}`): Promise<ArtifactDownloadUrlResponse>;
+    /** Retrieve Artifact metadata. */
+    get(artifactId: `art_${string}`): Promise<Artifact>;
     /** List Artifacts exported from this Sandbox. */
-    list(): Promise<readonly Artifact[]>;
+    list(input?: ListInput): Promise<AutoPage<Artifact>>;
   };
   readonly code: {
     /** Create a Code Context in this Sandbox. */
@@ -51,7 +73,7 @@ export type SandboxHandle = Sandbox & {
     /** Retrieve Code Context metadata in this Sandbox. */
     getContext(contextId: `cctx_${string}`): Promise<CodeContextRef>;
     /** List Code Contexts in this Sandbox. */
-    listContexts(): Promise<readonly CodeContextRef[]>;
+    listContexts(input?: ListInput): Promise<AutoPage<CodeContextRef>>;
     /** Run interpreter code in this Sandbox. */
     run(input: RunCodeInput): Promise<RunCodeResult>;
     /** Stream interpreter code execution events from this Sandbox. */
@@ -63,13 +85,22 @@ export type SandboxHandle = Sandbox & {
       commandId: `cmd_${string}`,
       input?: { readonly mode?: "force" | "graceful" },
     ): Promise<Command>;
-    /** Run a Command in this Sandbox and wait for completion. */
+    /** Retrieve Command metadata. */
+    get(commandId: `cmd_${string}`): Promise<Command>;
+    /** Read bounded Command log chunks. */
+    logs(
+      commandId: `cmd_${string}`,
+      input?: { readonly afterSeq?: number; readonly limit?: number },
+    ): Promise<ListCommandLogsResponse>;
+    /** Run a Command, waiting unless `background` is true. */
     run(command: string, input?: RunCommandOptions): Promise<Command>;
-    /** Start a Command in this Sandbox without waiting for completion. */
-    start(
-      command: string,
-      input?: Omit<RunCommandOptions, "collect" | "collectOn">,
-    ): Promise<Command>;
+    /** Stream Command log events with optional reconnect support. */
+    streamLogs(
+      commandId: `cmd_${string}`,
+      input?: CommandStreamInput,
+    ): AsyncIterable<CommandLogStreamEvent>;
+    /** Poll until this Command reaches a terminal status. */
+    wait(commandId: `cmd_${string}`, input?: WaitForCommandInput): Promise<Command>;
   };
   readonly files: {
     /** Delete a Workspace file or empty directory in this Sandbox. */
@@ -77,7 +108,7 @@ export type SandboxHandle = Sandbox & {
     /** Create or reuse a short-lived download URL for a Workspace file. */
     downloadUrl(path: string): Promise<FileDownloadUrlResponse>;
     /** List entries in a Workspace directory. */
-    list(path?: string): Promise<readonly FileEntry[]>;
+    list(path?: string): Promise<ListFilesResponse>;
     /** Create a Workspace directory in this Sandbox. */
     mkdir(path: string, input?: { readonly parents?: boolean }): Promise<FileStat>;
     /** Move or rename a Workspace file or directory. */
@@ -126,16 +157,22 @@ export type SandboxHandle = Sandbox & {
       readonly authMode?: PreviewAuthMode;
       readonly port: number;
     }): Promise<CreatePreviewResponse>;
+    /** Retrieve Preview metadata. */
+    get(previewId: `prv_${string}`): Promise<Preview>;
     /** List Previews for this Sandbox. */
-    list(): Promise<readonly Preview[]>;
+    list(input?: ListInput): Promise<AutoPage<Preview>>;
+    /** Revoke a Preview. */
+    revoke(previewId: `prv_${string}`): Promise<Preview>;
   };
-  /** Reset this live Sandbox TTL from now. */
-  extend(input: {
+  /** Set this Sandbox TTL and reset its expiration countdown from now. */
+  setTtl(input: {
     readonly idempotencyKey?: string;
     readonly ttlMs: number;
   }): Promise<SandboxHandle>;
   /** Kill this Sandbox. */
   kill(): Promise<SandboxHandle>;
+  /** Poll until this Sandbox is ready to accept work. */
+  waitUntilReady(input?: WaitUntilReadyInput): Promise<SandboxHandle>;
 };
 
 export type CreateCodeContextInput = {
@@ -164,10 +201,10 @@ export function createSandboxHandle(
     artifacts: createSandboxArtifactsClient(sandbox.id, transport),
     code: createSandboxCodeClient(sandbox.id, transport),
     commands: createSandboxCommands(sandbox, transport),
-    extend: async (input) => {
+    setTtl: async (input) => {
       const { idempotencyKey, ...body } = input;
-      const response = await transport.request<ExtendSandboxResponse>(
-        `/v1/sandboxes/${sandbox.id}/extend`,
+      const response = await transport.request<SetSandboxTtlResponse>(
+        `/v1/sandboxes/${sandbox.id}/ttl`,
         {
           body,
           ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
@@ -180,7 +217,7 @@ export function createSandboxHandle(
     },
     files: createSandboxFilesClient(sandbox.id, transport),
     kill: async () => {
-      const response = await transport.request<GetSandboxResponse>(
+      const response = await transport.request<KillSandboxResponse>(
         `/v1/sandboxes/${sandbox.id}`,
         { method: "DELETE" },
       );
@@ -188,6 +225,8 @@ export function createSandboxHandle(
       return createSandboxHandle(response.sandbox, transport);
     },
     previews: createSandboxPreviewsClient(sandbox.id, transport),
+    waitUntilReady: (input) =>
+      waitUntilSandboxReady(sandbox, transport, createSandboxHandle, input),
   };
 }
 
@@ -203,12 +242,29 @@ export function createSandboxPreviewsClient(
       );
       return response;
     },
-    async list() {
-      const response = await transport.request<ListPreviewsResponse>(
-        `/v1/sandboxes/${sandboxId}/previews`,
+    async get(previewId) {
+      const response = await transport.request<GetPreviewResponse>(
+        `/v1/previews/${previewId}`,
         { method: "GET" },
       );
-      return response.data;
+      return response.preview;
+    },
+    async list(input = {}) {
+      const fetchPage = (cursor = input.cursor) =>
+        transport.request<ListPreviewsResponse>(
+          `/v1/sandboxes/${sandboxId}/previews${queryString(
+            paginationParams({ ...input, cursor }),
+          )}`,
+          { method: "GET", signal: input.signal },
+        );
+      return createPage(await fetchPage(), fetchPage);
+    },
+    async revoke(previewId) {
+      const response = await transport.request<DeletePreviewResponse>(
+        `/v1/previews/${previewId}`,
+        { method: "DELETE" },
+      );
+      return response.preview;
     },
   };
 }
@@ -231,12 +287,38 @@ export function createSandboxArtifactsClient(
       );
       return response.artifact;
     },
-    async list() {
-      const response = await transport.request<ListArtifactsResponse>(
-        `/v1/sandboxes/${sandboxId}/artifacts`,
+    async delete(artifactId) {
+      const response = await transport.request<DeleteArtifactResponse>(
+        `/v1/artifacts/${artifactId}`,
+        { method: "DELETE" },
+      );
+      return response.artifact;
+    },
+    download(artifactId) {
+      return transport.download(`/v1/artifacts/${artifactId}/download`);
+    },
+    downloadUrl(artifactId) {
+      return transport.request<ArtifactDownloadUrlResponse>(
+        `/v1/artifacts/${artifactId}/download-url`,
+        { method: "POST" },
+      );
+    },
+    async get(artifactId) {
+      const response = await transport.request<GetArtifactResponse>(
+        `/v1/artifacts/${artifactId}`,
         { method: "GET" },
       );
-      return response.data;
+      return response.artifact;
+    },
+    async list(input = {}) {
+      const fetchPage = (cursor = input.cursor) =>
+        transport.request<ListArtifactsResponse>(
+          `/v1/sandboxes/${sandboxId}/artifacts${queryString(
+            paginationParams({ ...input, cursor }),
+          )}`,
+          { method: "GET", signal: input.signal },
+        );
+      return createPage(await fetchPage(), fetchPage);
     },
   };
 }
@@ -273,12 +355,15 @@ export function createSandboxCodeClient(
       );
       return response.context;
     },
-    async listContexts() {
-      const response = await transport.request<ListCodeContextsResponse>(
-        `/v1/sandboxes/${sandboxId}/code/contexts`,
-        { method: "GET" },
-      );
-      return response.data;
+    async listContexts(input = {}) {
+      const fetchPage = (cursor = input.cursor) =>
+        transport.request<ListCodeContextsResponse>(
+          `/v1/sandboxes/${sandboxId}/code/contexts${queryString(
+            paginationParams({ ...input, cursor }),
+          )}`,
+          { method: "GET", signal: input.signal },
+        );
+      return createPage(await fetchPage(), fetchPage);
     },
     async run(input) {
       const { idempotencyKey, ...body } = input;
@@ -306,130 +391,4 @@ export function createSandboxCodeClient(
       );
     },
   };
-}
-
-function createSandboxCommands(
-  sandbox: Sandbox,
-  transport: Transport,
-): SandboxHandle["commands"] {
-  return {
-    cancel(commandId, input = {}) {
-      return cancelCommand(transport, commandId, input);
-    },
-    run(command, input = {}) {
-      return runCommandWithCallbacks(transport, sandbox.id, command, "run", input);
-    },
-    start(command, input = {}) {
-      return runCommandWithCallbacks(transport, sandbox.id, command, "start", input);
-    },
-  };
-}
-
-export function createSandboxFilesClient(
-  sandboxId: `sbx_${string}`,
-  transport: Transport,
-): SandboxHandle["files"] {
-  return {
-    async delete(path) {
-      await transport.request<DeleteFileResponse>(
-        `/v1/sandboxes/${sandboxId}/files?path=${encodeURIComponent(path)}`,
-        { method: "DELETE" },
-      );
-    },
-    downloadUrl(path) {
-      return transport.request<FileDownloadUrlResponse>(
-        `/v1/sandboxes/${sandboxId}/files/download-url`,
-        { body: { path }, method: "POST" },
-      );
-    },
-    async list(path = "/workspace") {
-      const response = await transport.request<ListFilesResponse>(
-        `/v1/sandboxes/${sandboxId}/files?path=${encodeURIComponent(path)}`,
-        { method: "GET" },
-      );
-      return response.data;
-    },
-    async mkdir(path, input = {}) {
-      const response = await transport.request<{ readonly file: FileStat }>(
-        `/v1/sandboxes/${sandboxId}/files/mkdir`,
-        { body: { path, ...input }, method: "POST" },
-      );
-      return response.file;
-    },
-    async move(from, to, input = {}) {
-      const response = await transport.request<{ readonly file: FileStat }>(
-        `/v1/sandboxes/${sandboxId}/files/move`,
-        { body: { from, to, ...input }, method: "POST" },
-      );
-      return response.file;
-    },
-    read(path, input = {}) {
-      return readSandboxFile(sandboxId, transport, path, input);
-    },
-    async readBytes(path) {
-      const content = await readSandboxFile(sandboxId, transport, path, {
-        encoding: "base64",
-      });
-      return base64ToBytes(content);
-    },
-    async stat(path) {
-      const response = await transport.request<{ readonly file: FileStat }>(
-        `/v1/sandboxes/${sandboxId}/files/stat?path=${encodeURIComponent(path)}`,
-        { method: "GET" },
-      );
-      return response.file;
-    },
-    write(path, content, input = {}) {
-      return writeSandboxFile(sandboxId, transport, path, content, input);
-    },
-    writeBytes(path, bytes, input = {}) {
-      return writeSandboxFile(sandboxId, transport, path, bytesToBase64(bytes), {
-        ...input,
-        encoding: "base64",
-      });
-    },
-  };
-}
-
-async function readSandboxFile(
-  sandboxId: `sbx_${string}`,
-  transport: Transport,
-  path: string,
-  input: { readonly encoding?: FileEncoding } = {},
-): Promise<string> {
-  const response = await transport.request<{
-    readonly content: string;
-    readonly encoding: FileEncoding;
-  }>(readFilePath(sandboxId, path, input.encoding), { method: "GET" });
-  return response.content;
-}
-
-async function writeSandboxFile(
-  sandboxId: `sbx_${string}`,
-  transport: Transport,
-  path: string,
-  content: string,
-  input: {
-    readonly createParents?: boolean;
-    readonly encoding?: FileEncoding;
-    readonly overwrite?: boolean;
-  } = {},
-): Promise<FileStat> {
-  const response = await transport.request<{ readonly file: FileStat }>(
-    `/v1/sandboxes/${sandboxId}/files`,
-    { body: { content, path, ...input }, method: "PUT" },
-  );
-  return response.file;
-}
-
-function readFilePath(
-  sandboxId: `sbx_${string}`,
-  path: string,
-  encoding?: FileEncoding,
-): string {
-  const encodedPath = encodeURIComponent(path);
-  const encodingParam =
-    encoding === undefined ? "" : `&encoding=${encodeURIComponent(encoding)}`;
-
-  return `/v1/sandboxes/${sandboxId}/files/read?path=${encodedPath}${encodingParam}`;
 }

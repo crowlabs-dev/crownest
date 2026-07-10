@@ -85,6 +85,28 @@ function registerPreviewTokenTests() {
       JSON.stringify({ authMode: "token", port: 8080 }),
     );
   });
+
+  it("accepts canonical --auth-mode for token previews", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse({
+        preview: previewResponse({ authMode: "token" }),
+        previewToken: "pvt_abc123",
+      }),
+    );
+
+    await expect(
+      runCli(
+        ["previews", "create", "sbx_123", "--port", "8080", "--auth-mode", "token"],
+        cliEnvironment,
+        fetchMock,
+      ),
+    ).resolves.toMatchObject({
+      stdout: "https://p-a1b2c3.crownest.dev\nPreview token (shown once): pvt_abc123\n",
+    });
+    expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(
+      JSON.stringify({ authMode: "token", port: 8080 }),
+    );
+  });
 }
 
 function registerPreviewValidationTests() {
